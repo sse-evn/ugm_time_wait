@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 # --- Конфигурация ---
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5') # Часовой пояс UTC+5
+GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5') # Часовой пояс UTC+5 (Алматы)
 
 # --- ID администраторов из .env ---
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
@@ -50,7 +50,7 @@ def init_db():
             end_time TEXT,
             zone TEXT,
             witag TEXT,
-            created_at TIMESTAMP
+            created_at TIMESTAMP -- Добавлено поле для времени создания записи
         )
     ''')
     conn.commit()
@@ -59,17 +59,20 @@ def init_db():
 def add_shift(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
+    # Сохраняем текущее время по часовому поясу группы
+    current_time_utc5 = datetime.now(GROUP_TIMEZONE)
     cur.execute('''
         INSERT INTO shifts (user_id, full_name, photo_file_id, shift_date, start_time, end_time, zone, witag, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, datetime.now(GROUP_TIMEZONE)))
+    ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, current_time_utc5))
     conn.commit()
     conn.close()
 
 def get_shifts_for_date(report_date):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    cur.execute("SELECT full_name, start_time, end_time, zone, witag FROM shifts WHERE shift_date = ?", (report_date,))
+    # Теперь выбираем и created_at
+    cur.execute("SELECT full_name, start_time, end_time, zone, witag, created_at FROM shifts WHERE shift_date = ?", (report_date,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -230,9 +233,19 @@ async def get_report(message: types.Message):
     morning_shift_employees = []
     evening_shift_employees = []
     full_day_shift_employees = []
+    
+    # Сортируем смены по времени создания для более логичного вывода
+    # Для этого преобразуем строку created_at в объект datetime
+    sorted_shifts = sorted(shifts, key=lambda x: datetime.strptime(x[5], '%Y-%m-%d %H:%M:%S.%f%z'))
 
-    for name, start, end, zone, witag in shifts:
-        shift_info = f"  - `{name}` ({zone}, Witag: {witag})"
+
+    for name, start, end, zone, witag, created_at_str in sorted_shifts:
+        # Парсим строку created_at в datetime объект, учитывая часовой пояс
+        # created_at_str будет иметь формат 'YYYY-MM-DD HH:MM:SS.ffffff+HH:MM'
+        created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE)
+        created_time_display = created_dt.strftime('%H:%M') # Только часы и минуты
+
+        shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
         if start == "07:00" and end == "15:00":
             morning_shift_employees.append(shift_info)
         elif start == "15:00" and end == "23:00":
@@ -250,7 +263,7 @@ async def get_report(message: types.Message):
 
     if morning_shift_employees:
         report_text.append(f"**☀️ Утренняя смена (07:00 - 15:00): {len(morning_shift_employees)} чел.**")
-        report_text.extend(sorted(morning_shift_employees))
+        report_text.extend(morning_shift_employees) # Уже отсортировано по времени создания
     else:
         report_text.append("**☀️ Утренняя смена (07:00 - 15:00): 0 чел.**\n  - *Нет сотрудников*")
     
@@ -258,7 +271,7 @@ async def get_report(message: types.Message):
     
     if evening_shift_employees:
         report_text.append(f"**🌙 Вечерняя смена (15:00 - 23:00): {len(evening_shift_employees)} чел.**")
-        report_text.extend(sorted(evening_shift_employees))
+        report_text.extend(evening_shift_employees) # Уже отсортировано по времени создания
     else:
         report_text.append("**🌙 Вечерняя смена (15:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
 
@@ -266,7 +279,7 @@ async def get_report(message: types.Message):
 
     if full_day_shift_employees:
         report_text.append(f"**🗓️ Целый день (07:00 - 23:00): {len(full_day_shift_employees)} чел.**")
-        report_text.extend(sorted(full_day_shift_employees))
+        report_text.extend(full_day_shift_employees) # Уже отсортировано по времени создания
     else:
         report_text.append("**🗓️ Целый день (07:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
 
