@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, time # Импортируем time для удобства сравнения времени
 import pytz
 
 from aiogram import Bot, Dispatcher, executor, types
@@ -79,15 +79,16 @@ def get_shifts_for_date(report_date):
     conn.close()
     return rows
 
-# --- Вспомогательные функции для валидации ---
-def is_valid_date(date_str, fmt='%d.%m.%y'):
-    """Проверяет корректность формата даты."""
-    try:
-        datetime.strptime(date_str, fmt)
-        return True
-    except ValueError:
-        return False
+def get_user_shifts_for_date(user_id, shift_date):
+    """Получает все смены для конкретного пользователя на указанную дату."""
+    conn = sqlite3.connect('shifts.db')
+    cur = conn.cursor()
+    cur.execute("SELECT start_time, end_time FROM shifts WHERE user_id = ? AND shift_date = ?", (user_id, shift_date))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
+# --- Вспомогательные функции для валидации ---
 def is_valid_time(time_str, fmt='%H:%M'):
     """Проверяет корректность формата времени."""
     try:
@@ -106,15 +107,13 @@ async def send_welcome(message: types.Message):
         "Чтобы записаться на смену, отправьте фото с подписью **СТРОГО** в следующем формате:\n\n"
         "```\n"
         "Имя Фамилия\n"
-        "ДД.ММ.ГГ (например, 17.07.25)\n"
         "ЧЧ:ММ ЧЧ:ММ (например, 07:00 15:00)\n"
         "Зона XX (например, Зона 12)\n"
         "W witag XX (необязательно, если нет, просто пропустите эту строку)\n"
         "```\n\n"
-        "**Пример правильной подписи:**\n"
+        "**Пример правильной подписи (дата ставится автоматически):**\n"
         "```\n"
         "Иван Петров\n"
-        "17.07.25\n"
         "07:00 15:00\n"
         "Зона 10\n"
         "W witag 5\n"
@@ -122,7 +121,6 @@ async def send_welcome(message: types.Message):
         "Если у вас нет `W witag`, просто не указывайте последнюю строку.\n"
         "```\n"
         "Иван Петров\n"
-        "17.07.25\n"
         "07:00 15:00\n"
         "Зона 10\n"
         "```\n\n"
@@ -145,16 +143,17 @@ async def handle_photo_with_caption(message: types.Message):
         await message.reply("❌ Пожалуйста, добавьте подпись к фотографии в указанном формате.")
         return
 
+    # Автоматически определяем сегодняшнюю дату
+    shift_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
+
     # Паттерн для разбора подписи с помощью регулярных выражений
-    # Учитываем, что witag может отсутствовать
+    # Удалена строка с датой
     pattern = re.compile(
         r'^(?P<name>[\w\sА-Яа-я]+)\n'
-        r'(?P<date>\d{2}\.\d{2}\.\d{2,4})\n'
         r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\n'
         r'(?P<zone>Зона\s+\d+)\s*$'
         r'|' # Или паттерн с witag
         r'^(?P<name_w>[\w\sА-Яа-я]+)\n'
-        r'(?P<date_w>\d{2}\.\d{2}\.\d{2,4})\n'
         r'(?P<start_time_w>\d{2}:\d{2})\s(?P<end_time_w>\d{2}:\d{2})\n'
         r'(?P<zone_w>Зона\s+\d+)\n'
         r'(?P<witag_val>W\s+witag\s+\d+)$',
@@ -167,10 +166,9 @@ async def handle_photo_with_caption(message: types.Message):
         logging.warning(f"Неверный формат подписи от {user_full_name}: '{message.caption}'")
         await message.reply(
             "❌ Неверный формат данных в подписи. Пожалуйста, проверьте и попробуйте снова.\n"
-            "Используйте формат:\n"
+            "Используйте формат (дата ставится автоматически):\n"
             "```\n"
             "Имя Фамилия\n"
-            "ДД.ММ.ГГ\n"
             "ЧЧ:ММ ЧЧ:ММ\n"
             "Зона XX\n"
             "W witag XX (необязательно)\n"
@@ -182,48 +180,65 @@ async def handle_photo_with_caption(message: types.Message):
     # Извлекаем данные в зависимости от того, какой паттерн совпал
     if match.group('name'): # Совпал паттерн без witag
         full_name = match.group('name').strip()
-        shift_date = match.group('date')
-        start_time = match.group('start_time')
-        end_time = match.group('end_time')
+        start_time_str = match.group('start_time')
+        end_time_str = match.group('end_time')
         zone = match.group('zone').strip()
         witag = "Нет"
     else: # Совпал паттерн с witag
         full_name = match.group('name_w').strip()
-        shift_date = match.group('date_w')
-        start_time = match.group('start_time_w')
-        end_time = match.group('end_time_w')
+        start_time_str = match.group('start_time_w')
+        end_time_str = match.group('end_time_w')
         zone = match.group('zone_w').strip()
         witag = match.group('witag_val').strip()
 
     photo_file_id = message.photo[-1].file_id
 
     # --- Валидация данных ---
-    if not is_valid_date(shift_date):
-        await message.reply("❌ Неверный формат даты. Используйте формат **ДД.ММ.ГГ** (например, 17.07.25).")
-        return
-
-    if not is_valid_time(start_time) or not is_valid_time(end_time):
+    if not is_valid_time(start_time_str) or not is_valid_time(end_time_str):
         await message.reply("❌ Неверный формат времени. Используйте формат **ЧЧ:ММ** (например, 07:00).")
         return
 
     try:
-        start_dt = datetime.strptime(start_time, '%H:%M').time()
-        end_dt = datetime.strptime(end_time, '%H:%M').time()
-        if start_dt >= end_dt:
+        # Преобразуем строки времени в объекты time для сравнения
+        new_start_time = datetime.strptime(start_time_str, '%H:%M').time()
+        new_end_time = datetime.strptime(end_time_str, '%H:%M').time()
+
+        if new_start_time >= new_end_time:
             await message.reply("❌ Время начала смены должно быть раньше времени окончания смены.")
             return
     except Exception:
-        # Это должно быть поймано is_valid_time, но как подстраховка
         await message.reply("❌ Не удалось разобрать время смены. Убедитесь, что формат ЧЧ:ММ.")
         return
 
+    # --- Проверка на пересечение смен для текущего пользователя на эту дату ---
+    existing_shifts = get_user_shifts_for_date(user_id, shift_date)
+    
+    for existing_start_str, existing_end_str in existing_shifts:
+        existing_start_time = datetime.strptime(existing_start_str, '%H:%M').time()
+        existing_end_time = datetime.strptime(existing_end_str, '%H:%M').time()
+
+        # Логика проверки пересечения: (StartA < EndB) AND (EndA > StartB)
+        # Если новая смена начинается раньше, чем заканчивается существующая, И
+        # новая смена заканчивается позже, чем начинается существующая.
+        # Это покрывает все случаи частичного или полного пересечения.
+        # Точка соприкосновения (например, 15:00-23:00 и 07:00-15:00) не считается пересечением.
+        if (new_start_time < existing_end_time) and (new_end_time > existing_start_time):
+            await message.reply(
+                f"❌ Вы уже записаны на смену, которая пересекается с выбранным временем "
+                f"({existing_start_str}-{existing_end_str}) на {shift_date}. "
+                f"Нельзя записываться на две смены, которые совпадают по времени."
+            )
+            logging.info(f"Пользователь {user_full_name} (ID: {user_id}) пытался добавить пересекающуюся смену.")
+            return # Прекращаем обработку
+
+    # Если пересечений не найдено, добавляем смену
     try:
-        add_shift(user_id, full_name, photo_file_id, shift_date, start_time, end_time, zone, witag)
-        logging.info(f"Смена для {full_name} на {shift_date} ({start_time}-{end_time}) успешно добавлена.")
+        add_shift(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
+        logging.info(f"Смена для {full_name} на {shift_date} ({start_time_str}-{end_time_str}) успешно добавлена.")
         await message.reply(
             f"✅ Сотрудник **{full_name}** успешно записан на смену.\n"
-            f"Дата: `{shift_date}`\n"
-            f"Время: `{start_time}-{end_time}`\n"
+            f"Дата: `{shift_date}` (автоматически установлена на сегодня)\n"
+            f"Время: `{start_time_str}-{end_time_str}`\n"
             f"Зона: `{zone}`\n"
             f"Witag: `{witag}`",
             parse_mode=ParseMode.MARKDOWN
