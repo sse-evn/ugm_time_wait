@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, time # Импортируем time для удобства сравнения времени
+from datetime import datetime, time
 import pytz
 
 from aiogram import Bot, Dispatcher, executor, types
@@ -15,16 +15,15 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5') # Часовой пояс UTC+5
 
 # --- ID администраторов, которые могут использовать команду /report ---
-# Читаем из .env и преобразуем строку "123,456,789" в множество {123, 456, 789}
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
 if ADMIN_IDS_STR:
     try:
         ADMIN_IDS = {int(uid.strip()) for uid in ADMIN_IDS_STR.split(',')}
     except ValueError:
         logging.error("Ошибка при парсинге ADMIN_IDS из .env. Убедитесь, что это список чисел, разделенных запятыми.")
-        ADMIN_IDS = set() # Пустой набор, если ошибка парсинга
+        ADMIN_IDS = set()
 else:
-    ADMIN_IDS = set() # Пустой набор, если переменная не задана
+    ADMIN_IDS = set()
 
 if not ADMIN_IDS:
     logging.warning("Внимание: ADMIN_IDS не настроены в файле .env или содержат ошибки. Команда /report будет недоступна.")
@@ -39,7 +38,6 @@ dp = Dispatcher(bot)
 
 # --- База данных SQLite ---
 def init_db():
-    """Инициализирует базу данных и создает таблицу, если она не существует."""
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
     cur.execute('''
@@ -60,7 +58,6 @@ def init_db():
     conn.close()
 
 def add_shift(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
-    """Добавляет новую смену в базу данных."""
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
     cur.execute('''
@@ -71,7 +68,6 @@ def add_shift(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag)
     conn.close()
 
 def get_shifts_for_date(report_date):
-    """Получает все смены на указанную дату."""
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
     cur.execute("SELECT full_name, start_time, end_time, zone, witag FROM shifts WHERE shift_date = ?", (report_date,))
@@ -80,7 +76,6 @@ def get_shifts_for_date(report_date):
     return rows
 
 def get_user_shifts_for_date(user_id, shift_date):
-    """Получает все смены для конкретного пользователя на указанную дату."""
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
     cur.execute("SELECT start_time, end_time FROM shifts WHERE user_id = ? AND shift_date = ?", (user_id, shift_date))
@@ -90,7 +85,6 @@ def get_user_shifts_for_date(user_id, shift_date):
 
 # --- Вспомогательные функции для валидации ---
 def is_valid_time(time_str, fmt='%H:%M'):
-    """Проверяет корректность формата времени."""
     try:
         datetime.strptime(time_str, fmt).time()
         return True
@@ -104,27 +98,29 @@ async def send_welcome(message: types.Message):
     """Отправляет приветственное сообщение и инструкции."""
     await message.reply(
         "👋 Привет! Я бот для учета смен.\n"
-        "Чтобы записаться на смену, отправьте фото с подписью **СТРОГО** в следующем формате:\n\n"
+        "Чтобы записаться на смену, отправьте фото с подписью **СТРОГО** в следующем формате.\n"
+        "**Каждая строка должна быть на новой строке!**\n\n"
         "```\n"
         "Имя Фамилия\n"
-        "ЧЧ:ММ ЧЧ:ММ (например, 07:00 15:00)\n"
-        "Зона XX (например, Зона 12)\n"
-        "W witag XX (необязательно, если нет, просто пропустите эту строку)\n"
+        "ЧЧ:ММ ЧЧ:ММ (Например: 07:00 15:00)\n"
+        "Зона XX (Например: Зона 12)\n"
+        "W witag XX (Необязательно. Если нет, просто пропустите эту строку)\n"
         "```\n\n"
-        "**Пример правильной подписи (дата ставится автоматически):**\n"
+        "**Примеры ПРАВИЛЬНЫХ подписей (дата ставится автоматически на сегодня):**\n"
+        "**Пример 1 (с Witag):**\n"
         "```\n"
         "Иван Петров\n"
         "07:00 15:00\n"
         "Зона 10\n"
         "W witag 5\n"
         "```\n\n"
-        "Если у вас нет `W witag`, просто не указывайте последнюю строку.\n"
+        "**Пример 2 (БЕЗ Witag):**\n"
         "```\n"
-        "Иван Петров\n"
-        "07:00 15:00\n"
-        "Зона 10\n"
+        "Муратбек Ербакыт\n"
+        "15:00 23:00\n"
+        "Зона 1\n"
         "```\n\n"
-        "Пожалуйста, будьте внимательны к формату! 😊",
+        "Пожалуйста, будьте внимательны к **формату и переносам строк!** 😊",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -147,16 +143,12 @@ async def handle_photo_with_caption(message: types.Message):
     shift_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
 
     # Паттерн для разбора подписи с помощью регулярных выражений
-    # Удалена строка с датой
+    # Строго требуем переносы строк (\n)
     pattern = re.compile(
-        r'^(?P<name>[\w\sА-Яа-я]+)\n'
-        r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\n'
-        r'(?P<zone>Зона\s+\d+)\s*$'
-        r'|' # Или паттерн с witag
-        r'^(?P<name_w>[\w\sА-Яа-я]+)\n'
-        r'(?P<start_time_w>\d{2}:\d{2})\s(?P<end_time_w>\d{2}:\d{2})\n'
-        r'(?P<zone_w>Зона\s+\d+)\n'
-        r'(?P<witag_val>W\s+witag\s+\d+)$',
+        r'^(?P<name>[\w\sА-Яа-я]+)\n' # Имя Фамилия, затем перенос строки
+        r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\n' # Время, затем перенос строки
+        r'(?P<zone>Зона\s+\d+)\n?' # Зона, затем опциональный перенос строки (для случая без witag)
+        r'(?P<witag_val>W\s+witag\s+\d+)?$', # Witag (опционально) до конца строки
         re.MULTILINE | re.IGNORECASE
     )
 
@@ -166,30 +158,31 @@ async def handle_photo_with_caption(message: types.Message):
         logging.warning(f"Неверный формат подписи от {user_full_name}: '{message.caption}'")
         await message.reply(
             "❌ Неверный формат данных в подписи. Пожалуйста, проверьте и попробуйте снова.\n"
+            "**Важно: Каждая строка должна быть на новой строке!**\n"
             "Используйте формат (дата ставится автоматически):\n"
             "```\n"
             "Имя Фамилия\n"
             "ЧЧ:ММ ЧЧ:ММ\n"
             "Зона XX\n"
             "W witag XX (необязательно)\n"
+            "```\n"
+            "**Пример правильной подписи:**\n"
+            "```\n"
+            "Иван Петров\n"
+            "07:00 15:00\n"
+            "Зона 10\n"
             "```",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Извлекаем данные в зависимости от того, какой паттерн совпал
-    if match.group('name'): # Совпал паттерн без witag
-        full_name = match.group('name').strip()
-        start_time_str = match.group('start_time')
-        end_time_str = match.group('end_time')
-        zone = match.group('zone').strip()
-        witag = "Нет"
-    else: # Совпал паттерн с witag
-        full_name = match.group('name_w').strip()
-        start_time_str = match.group('start_time_w')
-        end_time_str = match.group('end_time_w')
-        zone = match.group('zone_w').strip()
-        witag = match.group('witag_val').strip()
+    # Извлекаем данные
+    full_name = match.group('name').strip()
+    start_time_str = match.group('start_time')
+    end_time_str = match.group('end_time')
+    zone = match.group('zone').strip()
+    # Witag может быть None, если его не было
+    witag = match.group('witag_val').strip() if match.group('witag_val') else "Нет"
 
     photo_file_id = message.photo[-1].file_id
 
@@ -199,7 +192,6 @@ async def handle_photo_with_caption(message: types.Message):
         return
 
     try:
-        # Преобразуем строки времени в объекты time для сравнения
         new_start_time = datetime.strptime(start_time_str, '%H:%M').time()
         new_end_time = datetime.strptime(end_time_str, '%H:%M').time()
 
@@ -217,11 +209,6 @@ async def handle_photo_with_caption(message: types.Message):
         existing_start_time = datetime.strptime(existing_start_str, '%H:%M').time()
         existing_end_time = datetime.strptime(existing_end_str, '%H:%M').time()
 
-        # Логика проверки пересечения: (StartA < EndB) AND (EndA > StartB)
-        # Если новая смена начинается раньше, чем заканчивается существующая, И
-        # новая смена заканчивается позже, чем начинается существующая.
-        # Это покрывает все случаи частичного или полного пересечения.
-        # Точка соприкосновения (например, 15:00-23:00 и 07:00-15:00) не считается пересечением.
         if (new_start_time < existing_end_time) and (new_end_time > existing_start_time):
             await message.reply(
                 f"❌ Вы уже записаны на смену, которая пересекается с выбранным временем "
@@ -229,7 +216,7 @@ async def handle_photo_with_caption(message: types.Message):
                 f"Нельзя записываться на две смены, которые совпадают по времени."
             )
             logging.info(f"Пользователь {user_full_name} (ID: {user_id}) пытался добавить пересекающуюся смену.")
-            return # Прекращаем обработку
+            return
 
     # Если пересечений не найдено, добавляем смену
     try:
@@ -256,7 +243,6 @@ async def get_report(message: types.Message):
     """
     user_id = message.from_user.id
     
-    # --- Проверка ID пользователя на принадлежность к ADMIN_IDS ---
     if user_id not in ADMIN_IDS:
         logging.warning(f"Пользователь с ID {user_id} попытался использовать команду /report, но не является администратором.")
         await message.reply("🚫 Эта команда доступна только для авторизованных администраторов.")
@@ -264,7 +250,6 @@ async def get_report(message: types.Message):
 
     logging.info(f"Пользователь с ID {user_id} запросил отчет.")
 
-    # Формируем отчет на текущую дату
     today_date_str = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
     shifts = get_shifts_for_date(today_date_str)
 
@@ -272,7 +257,6 @@ async def get_report(message: types.Message):
         await message.reply(f"📄 На **{today_date_str}** смен не найдено.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Разделяем на утреннюю и вечернюю смены
     morning_shift_employees = []
     evening_shift_employees = []
     
@@ -283,20 +267,19 @@ async def get_report(message: types.Message):
         elif start == "15:00" and end == "23:00":
             evening_shift_employees.append(shift_info)
 
-    # Формируем текст отчета
     report_text = [f"**📊 Отчет по сменам на {today_date_str}**\n"]
     
     if morning_shift_employees:
         report_text.append("**☀️ Утренняя смена (07:00 - 15:00):**")
-        report_text.extend(sorted(morning_shift_employees)) # Сортировка для единообразия
+        report_text.extend(sorted(morning_shift_employees))
     else:
         report_text.append("**☀️ Утренняя смена (07:00 - 15:00):**\n  - *Нет сотрудников*")
     
-    report_text.append("\n") # Пустая строка для разделения
+    report_text.append("\n")
     
     if evening_shift_employees:
         report_text.append("**🌙 Вечерняя смена (15:00 - 23:00):**")
-        report_text.extend(sorted(evening_shift_employees)) # Сортировка для единообразия
+        report_text.extend(sorted(evening_shift_employees))
     else:
         report_text.append("**🌙 Вечерняя смена (15:00 - 23:00):**\n  - *Нет сотрудников*")
 
@@ -305,6 +288,6 @@ async def get_report(message: types.Message):
 
 # --- Запуск бота ---
 if __name__ == '__main__':
-    init_db()  # Создаем БД и таблицу при первом запуске
+    init_db()
     logging.info("Бот запущен...")
     executor.start_polling(dp, skip_updates=True)
