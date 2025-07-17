@@ -168,8 +168,6 @@ async def handle_photo_with_caption(message: types.Message):
         new_start_time = datetime.strptime(start_time_str, '%H:%M').time()
         new_end_time = datetime.strptime(end_time_str, '%H:%M').time()
 
-        # Проверка, что время начала раньше времени окончания.
-        # Для случая 07:00 - 23:00 это условие также будет работать корректно.
         if new_start_time >= new_end_time:
             await message.reply("❌ Время начала должно быть раньше окончания.")
             return
@@ -231,7 +229,7 @@ async def get_report(message: types.Message):
 
     morning_shift_employees = []
     evening_shift_employees = []
-    full_day_shift_employees = [] # Новая категория для смен 07:00-23:00
+    full_day_shift_employees = []
 
     for name, start, end, zone, witag in shifts:
         shift_info = f"  - `{name}` ({zone}, Witag: {witag})"
@@ -239,17 +237,16 @@ async def get_report(message: types.Message):
             morning_shift_employees.append(shift_info)
         elif start == "15:00" and end == "23:00":
             evening_shift_employees.append(shift_info)
-        elif start == "07:00" and end == "23:00": # Специальная обработка для целого дня
+        elif start == "07:00" and end == "23:00":
             full_day_shift_employees.append(shift_info)
 
-    # --- Подсчет общего количества людей ---
     total_employees = len(morning_shift_employees) + \
                       len(evening_shift_employees) + \
                       len(full_day_shift_employees)
 
     report_text = [f"**📊 Отчет на {today_date_str}**\n"]
     
-    report_text.append(f"**Общее количество людей: {total_employees}**\n") # Общий итог
+    report_text.append(f"**Общее количество людей: {total_employees}**\n")
 
     if morning_shift_employees:
         report_text.append(f"**☀️ Утренняя смена (07:00 - 15:00): {len(morning_shift_employees)} чел.**")
@@ -257,7 +254,7 @@ async def get_report(message: types.Message):
     else:
         report_text.append("**☀️ Утренняя смена (07:00 - 15:00): 0 чел.**\n  - *Нет сотрудников*")
     
-    report_text.append("\n") # Пустая строка для разделения
+    report_text.append("\n")
     
     if evening_shift_employees:
         report_text.append(f"**🌙 Вечерняя смена (15:00 - 23:00): {len(evening_shift_employees)} чел.**")
@@ -265,7 +262,7 @@ async def get_report(message: types.Message):
     else:
         report_text.append("**🌙 Вечерняя смена (15:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
 
-    report_text.append("\n") # Пустая строка для разделения
+    report_text.append("\n")
 
     if full_day_shift_employees:
         report_text.append(f"**🗓️ Целый день (07:00 - 23:00): {len(full_day_shift_employees)} чел.**")
