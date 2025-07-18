@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_TIMEZONE = pytz.timezone('Asia/Almaty')  # Исправлено на Asia/Almaty (UTC+5)
+GOOGLE_SHEETS_ID = "1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE"  # ID вашей таблицы
 
 # --- ID администраторов из .env ---
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
@@ -38,9 +39,9 @@ def init_google_sheets():
     try:
         creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
         client = gspread.authorize(creds)
-        spreadsheet = client.open("ShiftBotData")
+        spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)  # Используем ID таблицы
         logging.info("Успешно подключились к Google Sheets!")
-        return spreadsheet.worksheet("Sheet1")
+        return spreadsheet.worksheet("Sheet1")  # Убедитесь, что лист существует
     except Exception as e:
         logging.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True)
         raise
@@ -301,17 +302,17 @@ async def get_report(message: types.Message):
     # Сортируем смены по времени создания
     sorted_shifts = sorted(shifts, key=lambda x: datetime.fromisoformat(x[5]) if worksheet else x[5])
 
-    for name, start, end, zone, witag, created_at_str in sorted_sh tertiary
-    created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE) if worksheet else datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S.%f%z')
-    created_time_display = created_dt.strftime('%H:%M')
+    for name, start, end, zone, witag, created_at_str in sorted_shifts:
+        created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE) if worksheet else datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S.%f%z')
+        created_time_display = created_dt.strftime('%H:%M')
 
-    shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
-    if start == "07:00" and end == "15:00":
-        morning_shift_employees.append(shift_info)
-    elif start == "15:00" and end == "23:00":
-        evening_shift_employees.append(shift_info)
-    elif start == "07:00" and end == "23:00":
-        full_day_shift_employees.append(shift_info)
+        shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
+        if start == "07:00" and end == "15:00":
+            morning_shift_employees.append(shift_info)
+        elif start == "15:00" and end == "23:00":
+            evening_shift_employees.append(shift_info)
+        elif start == "07:00" and end == "23:00":
+            full_day_shift_employees.append(shift_info)
 
     total_employees = len(morning_shift_employees) + len(evening_shift_employees) + len(full_day_shift_employees)
 
