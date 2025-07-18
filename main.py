@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, time
 import pytz
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ParseMode
 from dotenv import load_dotenv
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 # --- Конфигурация ---
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5')  # Часовой пояс UTC+5 (Алматы)
+GROUP_TIMEZONE = pytz.timezone('Asia/Almaty')  # Исправлено на Asia/Almaty (UTC+5)
 
 # --- ID администраторов из .env ---
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
@@ -30,15 +30,20 @@ if not ADMIN_IDS:
     logging.warning("ADMIN_IDS не настроены или содержат ошибки. Команда /report будет недоступна.")
 
 # --- Настройка логирования ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # --- Инициализация Google Sheets ---
 def init_google_sheets():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name('path_to_your_service_account.json', scope)
-    client = gspread.authorize(creds)
-    spreadsheet = client.open("ShiftBotData")  # Название вашей таблицы
-    return spreadsheet.worksheet("Sheet1")  # Название листа
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    try:
+        creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open("ShiftBotData")
+        logging.info("Успешно подключились к Google Sheets!")
+        return spreadsheet.worksheet("Sheet1")
+    except Exception as e:
+        logging.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True)
+        raise
 
 # --- Инициализация SQLite ---
 def init_db():
@@ -72,12 +77,11 @@ def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone,
     ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, current_time_utc5))
     conn.commit()
     conn.close()
-    return cur.lastrowid  # Возвращаем ID новой записи
+    return cur.lastrowid
 
 # --- Добавление смены в Google Sheets ---
 def add_shift_gsheets(worksheet, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at):
     try:
-        # Получаем все строки, чтобы определить следующий ID
         rows = worksheet.get_all_values()
         next_id = len(rows)  # ID = количество строк (заголовок + данные)
         worksheet.append_row([
@@ -85,7 +89,7 @@ def add_shift_gsheets(worksheet, user_id, full_name, photo_id, s_date, s_time, e
         ])
         logging.info(f"Смена для {full_name} добавлена в Google Sheets.")
     except Exception as e:
-        logging.error(f"Ошибка при добавлении в Google Sheets: {e}")
+        logging.error(f"Ошибка при добавлении в Google Sheets: {e}", exc_info=True)
 
 # --- Получение смен за дату из SQLite ---
 def get_shifts_for_date_sqlite(report_date):
@@ -106,7 +110,7 @@ def get_shifts_for_date_gsheets(worksheet, report_date):
                 shifts.append((row[2], row[5], row[6], row[7], row[8], row[9]))  # full_name, start_time, end_time, zone, witag, created_at
         return shifts
     except Exception as e:
-        logging.error(f"Ошибка при получении данных из Google Sheets: {e}")
+        logging.error(f"Ошибка при получении данных из Google Sheets: {e}", exc_info=True)
         return []
 
 # --- Проверка на пересечение смен в SQLite ---
@@ -128,7 +132,7 @@ def get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date):
                 shifts.append((row[5], row[6]))  # start_time, end_time
         return shifts
     except Exception as e:
-        logging.error(f"Ошибка при проверке пересечений в Google Sheets: {e}")
+        logging.error(f"Ошибка при проверке пересечений в Google Sheets: {e}", exc_info=True)
         return []
 
 # --- Вспомогательные функции для валидации ---
@@ -142,7 +146,11 @@ def is_valid_time(time_str, fmt='%H:%M'):
 # --- Инициализация бота и диспетчера ---
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
-worksheet = init_google_sheets()  # Инициализация Google Sheets
+try:
+    worksheet = init_google_sheets()  # Инициализация Google Sheets
+except Exception as e:
+    logging.error(f"Не удалось инициализировать Google Sheets: {e}")
+    worksheet = None  # Продолжаем работать с SQLite, если Google Sheets недоступен
 
 # --- Обработчики команд и сообщений ---
 
@@ -230,7 +238,7 @@ async def handle_photo_with_caption(message: types.Message):
 
     # --- Проверка на пересечение смен ---
     existing_shifts_sqlite = get_user_shifts_for_date_sqlite(user_id, shift_date)
-    existing_shifts_gsheets = get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date)
+    existing_shifts_gsheets = get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date) if worksheet else []
     existing_shifts = existing_shifts_sqlite + existing_shifts_gsheets
 
     for existing_start_str, existing_end_str in existing_shifts:
@@ -250,9 +258,10 @@ async def handle_photo_with_caption(message: types.Message):
     try:
         # Добавляем в SQLite
         shift_id = add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
-        # Добавляем в Google Sheets
-        current_time_utc5 = datetime.now(GROUP_TIMEZONE).isoformat()
-        add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag, current_time_utc5)
+        # Добавляем в Google Sheets, если доступно
+        if worksheet:
+            current_time_utc5 = datetime.now(GROUP_TIMEZONE).isoformat()
+            add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag, current_time_utc5)
         logging.info(f"Смена для {full_name} на {shift_date} ({start_time_str}-{end_time_str}) успешно добавлена.")
         await message.reply(
             f"✅ **{full_name}** записан на смену.\n"
@@ -279,7 +288,7 @@ async def get_report(message: types.Message):
     logging.info(f"ID {user_id} запросил отчет.")
 
     today_date_str = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
-    shifts = get_shifts_for_date_gsheets(worksheet, today_date_str)
+    shifts = get_shifts_for_date_gsheets(worksheet, today_date_str) if worksheet else get_shifts_for_date_sqlite(today_date_str)
 
     if not shifts:
         await message.reply(f"📄 На **{today_date_str}** смен не найдено.", parse_mode=ParseMode.MARKDOWN)
@@ -290,19 +299,19 @@ async def get_report(message: types.Message):
     full_day_shift_employees = []
 
     # Сортируем смены по времени создания
-    sorted_shifts = sorted(shifts, key=lambda x: datetime.fromisoformat(x[5]))
+    sorted_shifts = sorted(shifts, key=lambda x: datetime.fromisoformat(x[5]) if worksheet else x[5])
 
-    for name, start, end, zone, witag, created_at_str in sorted_shifts:
-        created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE)
-        created_time_display = created_dt.strftime('%H:%M')
+    for name, start, end, zone, witag, created_at_str in sorted_sh tertiary
+    created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE) if worksheet else datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S.%f%z')
+    created_time_display = created_dt.strftime('%H:%M')
 
-        shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
-        if start == "07:00" and end == "15:00":
-            morning_shift_employees.append(shift_info)
-        elif start == "15:00" and end == "23:00":
-            evening_shift_employees.append(shift_info)
-        elif start == "07:00" and end == "23:00":
-            full_day_shift_employees.append(shift_info)
+    shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
+    if start == "07:00" and end == "15:00":
+        morning_shift_employees.append(shift_info)
+    elif start == "15:00" and end == "23:00":
+        evening_shift_employees.append(shift_info)
+    elif start == "07:00" and end == "23:00":
+        full_day_shift_employees.append(shift_info)
 
     total_employees = len(morning_shift_employees) + len(evening_shift_employees) + len(full_day_shift_employees)
 
