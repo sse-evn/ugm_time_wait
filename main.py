@@ -4,7 +4,8 @@ import sqlite3
 import logging
 from datetime import datetime, time
 import pytz
-
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ParseMode
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 # --- Конфигурация ---
 load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5') # Часовой пояс UTC+5 (Алматы)
+GROUP_TIMEZONE = pytz.timezone('Etc/GMT-5')  # Часовой пояс UTC+5 (Алматы)
 
 # --- ID администраторов из .env ---
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
@@ -31,11 +32,15 @@ if not ADMIN_IDS:
 # --- Настройка логирования ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# --- Инициализация бота и диспетчера ---
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+# --- Инициализация Google Sheets ---
+def init_google_sheets():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name('path_to_your_service_account.json', scope)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open("ShiftBotData")  # Название вашей таблицы
+    return spreadsheet.worksheet("Sheet1")  # Название листа
 
-# --- База данных SQLite ---
+# --- Инициализация SQLite ---
 def init_db():
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -50,16 +55,16 @@ def init_db():
             end_time TEXT,
             zone TEXT,
             witag TEXT,
-            created_at TIMESTAMP -- Добавлено поле для времени создания записи
+            created_at TIMESTAMP
         )
     ''')
     conn.commit()
     conn.close()
 
-def add_shift(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
+# --- Добавление смены в SQLite ---
+def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    # Сохраняем текущее время по часовому поясу группы
     current_time_utc5 = datetime.now(GROUP_TIMEZONE)
     cur.execute('''
         INSERT INTO shifts (user_id, full_name, photo_file_id, shift_date, start_time, end_time, zone, witag, created_at)
@@ -67,23 +72,64 @@ def add_shift(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag)
     ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, current_time_utc5))
     conn.commit()
     conn.close()
+    return cur.lastrowid  # Возвращаем ID новой записи
 
-def get_shifts_for_date(report_date):
+# --- Добавление смены в Google Sheets ---
+def add_shift_gsheets(worksheet, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at):
+    try:
+        # Получаем все строки, чтобы определить следующий ID
+        rows = worksheet.get_all_values()
+        next_id = len(rows)  # ID = количество строк (заголовок + данные)
+        worksheet.append_row([
+            next_id, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at
+        ])
+        logging.info(f"Смена для {full_name} добавлена в Google Sheets.")
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении в Google Sheets: {e}")
+
+# --- Получение смен за дату из SQLite ---
+def get_shifts_for_date_sqlite(report_date):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    # Теперь выбираем и created_at
     cur.execute("SELECT full_name, start_time, end_time, zone, witag, created_at FROM shifts WHERE shift_date = ?", (report_date,))
     rows = cur.fetchall()
     conn.close()
     return rows
 
-def get_user_shifts_for_date(user_id, shift_date):
+# --- Получение смен за дату из Google Sheets ---
+def get_shifts_for_date_gsheets(worksheet, report_date):
+    try:
+        rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
+        shifts = []
+        for row in rows:
+            if row[4] == report_date:  # Проверяем дату смены (индекс 4)
+                shifts.append((row[2], row[5], row[6], row[7], row[8], row[9]))  # full_name, start_time, end_time, zone, witag, created_at
+        return shifts
+    except Exception as e:
+        logging.error(f"Ошибка при получении данных из Google Sheets: {e}")
+        return []
+
+# --- Проверка на пересечение смен в SQLite ---
+def get_user_shifts_for_date_sqlite(user_id, shift_date):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
     cur.execute("SELECT start_time, end_time FROM shifts WHERE user_id = ? AND shift_date = ?", (user_id, shift_date))
     rows = cur.fetchall()
     conn.close()
     return rows
+
+# --- Проверка на пересечение смен в Google Sheets ---
+def get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date):
+    try:
+        rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
+        shifts = []
+        for row in rows:
+            if int(row[1]) == user_id and row[4] == shift_date:  # user_id и shift_date
+                shifts.append((row[5], row[6]))  # start_time, end_time
+        return shifts
+    except Exception as e:
+        logging.error(f"Ошибка при проверке пересечений в Google Sheets: {e}")
+        return []
 
 # --- Вспомогательные функции для валидации ---
 def is_valid_time(time_str, fmt='%H:%M'):
@@ -92,6 +138,11 @@ def is_valid_time(time_str, fmt='%H:%M'):
         return True
     except ValueError:
         return False
+
+# --- Инициализация бота и диспетчера ---
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+worksheet = init_google_sheets()  # Инициализация Google Sheets
 
 # --- Обработчики команд и сообщений ---
 
@@ -112,12 +163,11 @@ async def send_welcome(message: types.Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
-
 @dp.message_handler(content_types=['photo'])
 async def handle_photo_with_caption(message: types.Message):
     """
     Обрабатывает получение фотографии с подписью, парсит данные
-    и сохраняет их в базу данных.
+    и сохраняет их в SQLite и Google Sheets.
     """
     user_id = message.from_user.id
     user_full_name = message.from_user.full_name
@@ -179,8 +229,10 @@ async def handle_photo_with_caption(message: types.Message):
         return
 
     # --- Проверка на пересечение смен ---
-    existing_shifts = get_user_shifts_for_date(user_id, shift_date)
-    
+    existing_shifts_sqlite = get_user_shifts_for_date_sqlite(user_id, shift_date)
+    existing_shifts_gsheets = get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date)
+    existing_shifts = existing_shifts_sqlite + existing_shifts_gsheets
+
     for existing_start_str, existing_end_str in existing_shifts:
         existing_start_time = datetime.strptime(existing_start_str, '%H:%M').time()
         existing_end_time = datetime.strptime(existing_end_str, '%H:%M').time()
@@ -196,7 +248,11 @@ async def handle_photo_with_caption(message: types.Message):
 
     # --- Добавление смены ---
     try:
-        add_shift(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
+        # Добавляем в SQLite
+        shift_id = add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
+        # Добавляем в Google Sheets
+        current_time_utc5 = datetime.now(GROUP_TIMEZONE).isoformat()
+        add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag, current_time_utc5)
         logging.info(f"Смена для {full_name} на {shift_date} ({start_time_str}-{end_time_str}) успешно добавлена.")
         await message.reply(
             f"✅ **{full_name}** записан на смену.\n"
@@ -210,10 +266,9 @@ async def handle_photo_with_caption(message: types.Message):
         logging.error(f"Ошибка при добавлении смены для {full_name}: {e}", exc_info=True)
         await message.reply("❗️ Внутренняя ошибка. Попробуйте позже.")
 
-
 @dp.message_handler(commands=['report'])
 async def get_report(message: types.Message):
-    """Отчет по сменам для админов на текущую дату."""
+    """Отчет по сменам для админов на текущую дату из Google Sheets."""
     user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
@@ -224,7 +279,7 @@ async def get_report(message: types.Message):
     logging.info(f"ID {user_id} запросил отчет.")
 
     today_date_str = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
-    shifts = get_shifts_for_date(today_date_str)
+    shifts = get_shifts_for_date_gsheets(worksheet, today_date_str)
 
     if not shifts:
         await message.reply(f"📄 На **{today_date_str}** смен не найдено.", parse_mode=ParseMode.MARKDOWN)
@@ -233,17 +288,13 @@ async def get_report(message: types.Message):
     morning_shift_employees = []
     evening_shift_employees = []
     full_day_shift_employees = []
-    
-    # Сортируем смены по времени создания для более логичного вывода
-    # Для этого преобразуем строку created_at в объект datetime
-    sorted_shifts = sorted(shifts, key=lambda x: datetime.strptime(x[5], '%Y-%m-%d %H:%M:%S.%f%z'))
 
+    # Сортируем смены по времени создания
+    sorted_shifts = sorted(shifts, key=lambda x: datetime.fromisoformat(x[5]))
 
     for name, start, end, zone, witag, created_at_str in sorted_shifts:
-        # Парсим строку created_at в datetime объект, учитывая часовой пояс
-        # created_at_str будет иметь формат 'YYYY-MM-DD HH:MM:SS.ffffff+HH:MM'
         created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE)
-        created_time_display = created_dt.strftime('%H:%M') # Только часы и минуты
+        created_time_display = created_dt.strftime('%H:%M')
 
         shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
         if start == "07:00" and end == "15:00":
@@ -253,17 +304,14 @@ async def get_report(message: types.Message):
         elif start == "07:00" and end == "23:00":
             full_day_shift_employees.append(shift_info)
 
-    total_employees = len(morning_shift_employees) + \
-                      len(evening_shift_employees) + \
-                      len(full_day_shift_employees)
+    total_employees = len(morning_shift_employees) + len(evening_shift_employees) + len(full_day_shift_employees)
 
     report_text = [f"**📊 Отчет на {today_date_str}**\n"]
-    
     report_text.append(f"**Общее количество людей: {total_employees}**\n")
 
     if morning_shift_employees:
         report_text.append(f"**☀️ Утренняя смена (07:00 - 15:00): {len(morning_shift_employees)} чел.**")
-        report_text.extend(morning_shift_employees) # Уже отсортировано по времени создания
+        report_text.extend(morning_shift_employees)
     else:
         report_text.append("**☀️ Утренняя смена (07:00 - 15:00): 0 чел.**\n  - *Нет сотрудников*")
     
@@ -271,7 +319,7 @@ async def get_report(message: types.Message):
     
     if evening_shift_employees:
         report_text.append(f"**🌙 Вечерняя смена (15:00 - 23:00): {len(evening_shift_employees)} чел.**")
-        report_text.extend(evening_shift_employees) # Уже отсортировано по времени создания
+        report_text.extend(evening_shift_employees)
     else:
         report_text.append("**🌙 Вечерняя смена (15:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
 
@@ -279,13 +327,11 @@ async def get_report(message: types.Message):
 
     if full_day_shift_employees:
         report_text.append(f"**🗓️ Целый день (07:00 - 23:00): {len(full_day_shift_employees)} чел.**")
-        report_text.extend(full_day_shift_employees) # Уже отсортировано по времени создания
+        report_text.extend(full_day_shift_employees)
     else:
         report_text.append("**🗓️ Целый день (07:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
 
-
     await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
-
 
 # --- Запуск бота ---
 if __name__ == '__main__':
