@@ -1,0 +1,229 @@
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_context import FSMContext
+from aiogram.contrib.fsm_context.storage.memory import MemoryStorage
+from aiogram.dispatcher.filters.state import State, StatesGroup
+import random
+from datetime import date, datetime, timedelta
+import json
+import os
+
+# --- Конфигурация бота ---
+BOT_TOKEN = "7834824023:AAEa2lPyacC-MUW69AHJeu_QcbvfqzDAJXI"
+AVAILABILITY_FILE = 'daily_availability.json' # Файл для хранения ежедневной доступности
+MAX_MESSAGE_LENGTH = 4000 # Максимальная длина сообщения для Telegram (чуть меньше 4096 для запаса)
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# Определение состояний для FSM
+class DailyAvailabilityStates(StatesGroup):
+    waiting_for_availability = State()
+
+# --- Вспомогательные функции для работы с файлом доступности ---
+
+def load_daily_availability():
+    """Загружает ежедневную доступность из JSON файла."""
+    if os.path.exists(AVAILABILITY_FILE):
+        try:
+            with open(AVAILABILITY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Проверяем, соответствует ли загруженная дата завтрашнему дню
+                tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+                if data.get("date") == tomorrow_str:
+                    return data.get("scouts", {})
+                else:
+                    # Если дата не совпадает, очищаем данные (устарели)
+                    return {}
+        except json.JSONDecodeError:
+            # Если файл поврежден, начинаем с нуля
+            return {}
+    return {}
+
+def save_daily_availability(availability_data):
+    """Сохраняет ежедневную доступность в JSON файл."""
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+    data_to_save = {
+        "date": tomorrow_str,
+        "scouts": availability_data
+    }
+    with open(AVAILABILITY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data_to_save, f, ensure_ascii=False, indent=4)
+
+def clear_daily_availability():
+    """Очищает файл ежедневной доступности (например, после генерации отчета)."""
+    if os.path.exists(AVAILABILITY_FILE):
+        os.remove(AVAILABILITY_FILE)
+
+async def send_long_message(chat_id: int, text: str):
+    """Отправляет длинное сообщение, разбивая его на части."""
+    chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+    for chunk in chunks:
+        await bot.send_message(chat_id, chunk)
+        
+# --- Обработчики команд ---
+
+@dp.message_handler(commands=['start', 'help'], state='*')
+async def send_welcome(message: types.Message):
+    """
+    Обрабатывает команды /start и /help.
+    """
+    await message.reply("Привет! Я бот для составления расписаний скаутов.\n"
+                        "Я помогу собрать данные о вашей доступности на завтра.\n\n"
+                        "Для скаутов: отправьте мне личное сообщение (не в группу!)\n"
+                        "  `/available <Имя_скаута> <ваша_смена>`\n"
+                        "  Примеры:\n"
+                        "  `/available Иван 7-15` (я работаю завтра с 7:00 до 15:00)\n"
+                        "  `/available Петр 15-23` (я работаю завтра с 15:00 до 23:00)\n"
+                        "  `/available Анна выходной` (у меня завтра выходной)\n"
+                        "  `/available Ольга свободен` (я свободен и готов работать в любую смену)\n\n"
+                        "Для супервайзеров (в группе):\n"
+                        "  `/report` - сгенерировать ежедневный отчет (расписание) на завтра.")
+
+@dp.message_handler(commands=['available'], state='*', chat_type=types.ChatType.PRIVATE)
+async def set_scout_availability(message: types.Message):
+    """
+    Позволяет скауту указать свою доступность на завтра.
+    Принимает формат: /available <Имя_скаута> <доступность>
+    """
+    args = message.get_args().split(maxsplit=1)
+    
+    if len(args) != 2:
+        await message.reply("Пожалуйста, укажите имя и доступность в формате:\n"
+                            "`/available <Ваше_Имя> <смена_или_выходной>`\n"
+                            "Примеры: `/available Иван 7-15`, `/available Анна выходной`, `/available Ольга свободен`")
+        return
+
+    scout_name = args[0].strip()
+    availability_info = args[1].strip().lower()
+
+    if not scout_name:
+        await message.reply("Имя скаута не может быть пустым.")
+        return
+
+    valid_shifts = ["7-15", "15-23", "выходной", "свободен", "свободна"]
+    if availability_info not in valid_shifts:
+        await message.reply(f"Неизвестный статус доступности: '{availability_info}'. "
+                            f"Пожалуйста, используйте: 7-15, 15-23, выходной, свободен.")
+        return
+
+    # Загружаем текущие данные
+    daily_availability = load_daily_availability()
+    daily_availability[scout_name] = availability_info
+    save_daily_availability(daily_availability)
+
+    await message.reply(f"Ваша доступность на завтра, {scout_name}, '{availability_info}', успешно записана.")
+
+
+@dp.message_handler(commands=['report'], state='*', chat_type=['group', 'supergroup'])
+async def generate_daily_report(message: types.Message, state: FSMContext):
+    """
+    Генерирует ежедневный отчет (расписание) на завтра на основе собранных данных.
+    """
+    await message.reply("Генерирую ежедневный отчет...")
+
+    daily_availability = load_daily_availability()
+    
+    if not daily_availability:
+        await message.reply("Данных о доступности скаутов на завтра не найдено. "
+                            "Попросите скаутов отправить `/available <Имя> <смена>` в личных сообщениях.")
+        return
+
+    # Определяем завтрашнюю дату
+    tomorrow = date.today() + timedelta(days=1)
+    schedule_date_str = tomorrow.strftime("%d.%m.%Y")
+
+    morning_shift_candidates = [] # Предпочитают утро
+    evening_shift_candidates = [] # Предпочитают вечер
+    any_shift_candidates = []     # Свободны, могут работать в любую смену
+
+    for scout_name, status in daily_availability.items():
+        if "выходной" in status:
+            continue # Скаут на выходном
+
+        if "7-15" in status:
+            morning_shift_candidates.append(scout_name)
+        elif "15-23" in status:
+            evening_shift_candidates.append(scout_name)
+        elif "свободен" in status or "свободна" in status:
+            any_shift_candidates.append(scout_name)
+    
+    # Перемешиваем списки для случайного выбора при заполнении
+    random.shuffle(morning_shift_candidates)
+    random.shuffle(evening_shift_candidates)
+    random.shuffle(any_shift_candidates)
+
+    final_morning_shift = []
+    final_evening_shift = []
+
+    # Заполняем утреннюю смену из тех, кто предпочитает утро
+    for scout in morning_shift_candidates:
+        if len(final_morning_shift) < 22:
+            final_morning_shift.append(scout)
+        else: # Если утренняя смена заполнена, а скаут остался, он может быть в "любых"
+            any_shift_candidates.append(scout)
+
+    # Заполняем вечернюю смену из тех, кто предпочитает вечер
+    for scout in evening_shift_candidates:
+        if len(final_evening_shift) < 22:
+            final_evening_shift.append(scout)
+        else: # Если вечерняя смена заполнена, а скаут остался, он может быть в "любых"
+            any_shift_candidates.append(scout)
+            
+    # Добираем недостающих из "свободных"
+    for scout in any_shift_candidates:
+        if len(final_morning_shift) < 22:
+            final_morning_shift.append(scout)
+        elif len(final_evening_shift) < 22:
+            final_evening_shift.append(scout)
+        else:
+            break # Обе смены заполнены
+
+    # Сообщение о том, сколько людей смогли собрать
+    total_assigned = len(final_morning_shift) + len(final_evening_shift)
+    
+    status_message = ""
+    if total_assigned < 44:
+        status_message = (f"Внимание: Не удалось набрать 44 скаута для расписания на завтра ({schedule_date_str}). "
+                          f"Назначено: {len(final_morning_shift)} на утро, {len(final_evening_shift)} на вечер. "
+                          "Проверьте, все ли скауты отметили свою доступность.")
+    else:
+        status_message = "Расписание успешно сформировано для 44 скаутов!"
+
+    # Формируем сообщение с расписанием
+    schedule_text = f"Ертеңгі {schedule_date_str}ж күннің алдын ала кестесі:\n" \
+                    f"Предварительный график на {schedule_date_str}г завтра:\n\n"
+
+    schedule_text += "--- Утренняя смена (7:00-15:00) ---\n"
+    if final_morning_shift:
+        for i, scout in enumerate(final_morning_shift, 1):
+            schedule_text += f"{i}. {scout}  7-15\n"
+    else:
+        schedule_text += "Нет скаутов на утреннюю смену.\n"
+
+    schedule_text += "\n--- Вечерняя смена (15:00-23:00) ---\n"
+    if final_evening_shift:
+        for i, scout in enumerate(final_evening_shift, 1):
+            schedule_text += f"{i + len(final_morning_shift)}. {scout}  15-23\n"
+    else:
+        schedule_text += "Нет скаутов на вечернюю смену.\n"
+
+    schedule_text += f"\n---\n{status_message}"
+
+    # Отправляем сообщение, разбивая на части, если оно слишком длинное
+    await send_long_message(message.chat.id, schedule_text)
+
+    # Очищаем данные о доступности после формирования отчета
+    clear_daily_availability()
+    await message.reply("Данные о доступности на завтра были очищены.")
+
+# --- Запуск бота ---
+if __name__ == '__main__':
+    from aiogram import executor
+    logging.info("Бот запущен...")
+    executor.start_polling(dp, skip_updates=True)
