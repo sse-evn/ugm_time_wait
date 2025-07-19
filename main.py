@@ -2,49 +2,89 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, time
+import fcntl
+import sys
+from datetime import datetime, time, timedelta
+from typing import Dict, List
 import pytz
 import gspread
 from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ParseMode
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
 # --- Конфигурация ---
 load_dotenv()
-API_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_TIMEZONE = pytz.timezone('Asia/Almaty')  # Исправлено на Asia/Almaty (UTC+5)
-GOOGLE_SHEETS_ID = "1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE"  # ID вашей таблицы
 
-# --- ID администраторов из .env ---
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
-if ADMIN_IDS_STR:
-    try:
-        ADMIN_IDS = {int(uid.strip()) for uid in ADMIN_IDS_STR.split(',')}
-    except ValueError:
-        logging.error("Ошибка парсинга ADMIN_IDS. Проверьте .env: список чисел через запятую.")
-        ADMIN_IDS = set()
-else:
-    ADMIN_IDS = set()
+# Проверка обязательных переменных
+required_vars = [
+    'BOT_TOKEN',
+    'ZONE_A_CHAT_ID',
+    'ZONE_B_CHAT_ID',
+    'REPORT_CHAT_ID',
+    'ADMIN_IDS',
+    'GOOGLE_SHEETS_CREDENTIALS_PATH'
+]
 
-if not ADMIN_IDS:
-    logging.warning("ADMIN_IDS не настроены или содержат ошибки. Команда /report будет недоступна.")
+for var in required_vars:
+    if not os.getenv(var):
+        logging.error(f'❌ Отсутствует переменная: {var}')
+        exit(1)
+
+# Настройки бота
+config = {
+    'BOT_TOKEN': os.getenv('BOT_TOKEN'),
+    'ZONE_A_CHAT_ID': int(os.getenv('ZONE_A_CHAT_ID')),
+    'ZONE_B_CHAT_ID': int(os.getenv('ZONE_B_CHAT_ID')),
+    'REPORT_CHAT_ID': int(os.getenv('REPORT_CHAT_ID')),
+    'ADMIN_IDS': list(map(int, os.getenv('ADMIN_IDS').split(','))),
+    'TIMEZONE': pytz.timezone(os.getenv('TIMEZONE', 'Asia/Almaty')),
+    'CHECK_INTERVAL': int(os.getenv('CHECK_INTERVAL', '300')),  # 5 минут по умолчанию
+    'INACTIVITY_THRESHOLD': int(os.getenv('INACTIVITY_THRESHOLD', '1800')),  # 30 минут по умолчанию
+    'MORNING_SHIFT': (int(os.getenv('MORNING_SHIFT_START', '7')), int(os.getenv('MORNING_SHIFT_END', '15'))),
+    'EVENING_SHIFT': (int(os.getenv('EVENING_SHIFT_START', '15')), int(os.getenv('EVENING_SHIFT_END', '23'))),
+    'ZONE_NAMES': {
+        'A': os.getenv('ZONE_A_NAME', 'Отчёты скаутов Е.О.М'),
+        'B': os.getenv('ZONE_B_NAME', '10 аумақ-зона')
+    },
+    'GOOGLE_SHEETS_ID': os.getenv('GOOGLE_SHEETS_ID', '1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE')
+}
 
 # --- Настройка логирования ---
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- Блокировка файла для предотвращения дублирования ---
+def acquire_lock():
+    lock_file = 'bot.lock'
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (IOError, OSError):
+        logger.error('❌ Бот уже запущен! Завершаю работу.')
+        sys.exit(1)
 
 # --- Инициализация Google Sheets ---
 def init_google_sheets():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
-        creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
+        creds = Credentials.from_service_account_file(config['GOOGLE_SHEETS_CREDENTIALS_PATH'], scopes=scope)
         client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)  # Используем ID таблицы
-        logging.info("Успешно подключились к Google Sheets!")
-        return spreadsheet.worksheet("Sheet1")  # Убедитесь, что лист существует
+        spreadsheet = client.open_by_key(config['GOOGLE_SHEETS_ID'])
+        logger.info("Успешно подключились к Google Sheets!")
+        return spreadsheet.worksheet("Sheet1")
     except Exception as e:
-        logging.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True)
-        raise
+        logger.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True)
+        return None
 
 # --- Инициализация SQLite ---
 def init_db():
@@ -61,7 +101,8 @@ def init_db():
             end_time TEXT,
             zone TEXT,
             witag TEXT,
-            created_at TIMESTAMP
+            created_at TIMESTAMP,
+            last_activity TIMESTAMP
         )
     ''')
     conn.commit()
@@ -71,72 +112,84 @@ def init_db():
 def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    current_time_utc5 = datetime.now(GROUP_TIMEZONE)
+    current_time = datetime.now(config['TIMEZONE'])
     cur.execute('''
-        INSERT INTO shifts (user_id, full_name, photo_file_id, shift_date, start_time, end_time, zone, witag, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, current_time_utc5))
+        INSERT INTO shifts (user_id, full_name, photo_file_id, shift_date, start_time, end_time, zone, witag, created_at, last_activity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, current_time, current_time))
     conn.commit()
     conn.close()
-    return cur.lastrowid
 
-# --- Добавление смены в Google Sheets ---
-def add_shift_gsheets(worksheet, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at):
-    try:
-        rows = worksheet.get_all_values()
-        next_id = len(rows)  # ID = количество строк (заголовок + данные)
-        worksheet.append_row([
-            next_id, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at
-        ])
-        logging.info(f"Смена для {full_name} добавлена в Google Sheets.")
-    except Exception as e:
-        logging.error(f"Ошибка при добавлении в Google Sheets: {e}", exc_info=True)
-
-# --- Получение смен за дату из SQLite ---
-def get_shifts_for_date_sqlite(report_date):
+# --- Обновление времени последней активности ---
+def update_user_activity(user_id):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    cur.execute("SELECT full_name, start_time, end_time, zone, witag, created_at FROM shifts WHERE shift_date = ?", (report_date,))
-    rows = cur.fetchall()
+    current_time = datetime.now(config['TIMEZONE'])
+    cur.execute('''
+        UPDATE shifts 
+        SET last_activity = ?
+        WHERE user_id = ? AND shift_date = ?
+    ''', (current_time, user_id, current_time.strftime('%d.%m.%y')))
+    conn.commit()
     conn.close()
-    return rows
 
-# --- Получение смен за дату из Google Sheets ---
-def get_shifts_for_date_gsheets(worksheet, report_date):
-    try:
-        rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
-        shifts = []
-        for row in rows:
-            if row[4] == report_date:  # Проверяем дату смены (индекс 4)
-                shifts.append((row[2], row[5], row[6], row[7], row[8], row[9]))  # full_name, start_time, end_time, zone, witag, created_at
-        return shifts
-    except Exception as e:
-        logging.error(f"Ошибка при получении данных из Google Sheets: {e}", exc_info=True)
-        return []
-
-# --- Проверка на пересечение смен в SQLite ---
-def get_user_shifts_for_date_sqlite(user_id, shift_date):
+# --- Получение активных пользователей ---
+def get_active_users():
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
-    cur.execute("SELECT start_time, end_time FROM shifts WHERE user_id = ? AND shift_date = ?", (user_id, shift_date))
-    rows = cur.fetchall()
+    current_time = datetime.now(config['TIMEZONE'])
+    threshold = current_time - timedelta(seconds=config['INACTIVITY_THRESHOLD'])
+    
+    cur.execute('''
+        SELECT user_id, full_name, zone, last_activity 
+        FROM shifts 
+        WHERE shift_date = ? AND last_activity > ?
+    ''', (current_time.strftime('%d.%m.%y'), threshold))
+    
+    active_users = cur.fetchall()
     conn.close()
-    return rows
+    return active_users
 
-# --- Проверка на пересечение смен в Google Sheets ---
-def get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date):
-    try:
-        rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
-        shifts = []
-        for row in rows:
-            if int(row[1]) == user_id and row[4] == shift_date:  # user_id и shift_date
-                shifts.append((row[5], row[6]))  # start_time, end_time
-        return shifts
-    except Exception as e:
-        logging.error(f"Ошибка при проверке пересечений в Google Sheets: {e}", exc_info=True)
-        return []
+# --- Получение неактивных пользователей ---
+def get_inactive_users():
+    conn = sqlite3.connect('shifts.db')
+    cur = conn.cursor()
+    current_time = datetime.now(config['TIMEZONE'])
+    threshold = current_time - timedelta(seconds=config['INACTIVITY_THRESHOLD'])
+    
+    cur.execute('''
+        SELECT user_id, full_name, zone, last_activity 
+        FROM shifts 
+        WHERE shift_date = ? AND last_activity <= ?
+    ''', (current_time.strftime('%d.%m.%y'), threshold))
+    
+    inactive_users = cur.fetchall()
+    conn.close()
+    return inactive_users
 
-# --- Вспомогательные функции для валидации ---
+# --- Инициализация бота ---
+try:
+    bot = Bot(token=config['BOT_TOKEN'])
+    storage = MemoryStorage()
+    dp = Dispatcher(bot, storage=storage)
+    logger.info("🤖 Бот инициализирован")
+except Exception as e:
+    logger.error(f"❌ Ошибка инициализации бота: {e}")
+    exit(1)
+
+# --- Глобальные переменные ---
+worksheet = init_google_sheets()
+init_db()
+
+# --- Вспомогательные функции ---
+def get_current_shift() -> str:
+    now = datetime.now(config['TIMEZONE']).hour
+    if config['MORNING_SHIFT'][0] <= now < config['MORNING_SHIFT'][1]:
+        return 'morning'
+    elif config['EVENING_SHIFT'][0] <= now < config['EVENING_SHIFT'][1]:
+        return 'evening'
+    return None
+
 def is_valid_time(time_str, fmt='%H:%M'):
     try:
         datetime.strptime(time_str, fmt).time()
@@ -144,50 +197,43 @@ def is_valid_time(time_str, fmt='%H:%M'):
     except ValueError:
         return False
 
-# --- Инициализация бота и диспетчера ---
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
-try:
-    worksheet = init_google_sheets()  # Инициализация Google Sheets
-except Exception as e:
-    logging.error(f"Не удалось инициализировать Google Sheets: {e}")
-    worksheet = None  # Продолжаем работать с SQLite, если Google Sheets недоступен
-
-# --- Обработчики команд и сообщений ---
-
+# --- Обработчики сообщений ---
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
-    """Отправляет приветственное сообщение и инструкции."""
     await message.reply(
-        "👋 Я бот для учета смен.\n"
-        "Отправьте фото с подписью **построчно** в формате:\n\n"
+        "👋 Я бот для учета смен и мониторинга активности.\n\n"
+        "📌 Чтобы записаться на смену, отправьте фото с подписью в формате:\n"
         "```\n"
-        "Ербакыт Муратбек\n"
+        "Имя Фамилия\n"
         "07:00 15:00\n"
         "Зона 12\n"
         "W witag 5 (необязательно)\n"
         "```\n\n"
-        "**Каждая строка — это Enter!** Дата ставится автоматически.\n"
-        "Можно указать смену на весь день: `07:00 23:00`",
+        "📊 Администраторы могут использовать команды:\n"
+        "/report - отчет по сменам\n"
+        "/activity - проверка активности",
         parse_mode=ParseMode.MARKDOWN
     )
 
 @dp.message_handler(content_types=['photo'])
 async def handle_photo_with_caption(message: types.Message):
-    """
-    Обрабатывает получение фотографии с подписью, парсит данные
-    и сохраняет их в SQLite и Google Sheets.
-    """
     user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Проверяем, что сообщение в нужном чате
+    if chat_id not in [config['ZONE_A_CHAT_ID'], config['ZONE_B_CHAT_ID']]:
+        return
+
     user_full_name = message.from_user.full_name
-    logging.info(f"Получено фото от {user_full_name} (ID: {user_id}).")
+    logger.info(f"Получено фото от {user_full_name} (ID: {user_id}).")
 
     if not message.caption:
         await message.reply("❌ Отправьте фото с подписью.")
         return
 
-    shift_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
+    shift_date = datetime.now(config['TIMEZONE']).strftime('%d.%m.%y')
 
+    # Парсинг подписи
     pattern = re.compile(
         r'^(?P<name>[\w\sА-Яа-я]+)\s+'
         r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\s+'
@@ -200,12 +246,10 @@ async def handle_photo_with_caption(message: types.Message):
     match = pattern.match(cleaned_caption)
 
     if not match:
-        logging.warning(f"Неверный формат подписи от {user_full_name}: '{message.caption}'")
         await message.reply(
-            "❌ Неверный формат подписи. **Каждая строка — это Enter!**\n"
-            "Пример:\n"
+            "❌ Неверный формат подписи. Пример:\n"
             "```\n"
-            "Ербакыт Муратбек\n"
+            "Имя Фамилия\n"
             "07:00 15:00\n"
             "Зона 12\n"
             "```",
@@ -219,9 +263,7 @@ async def handle_photo_with_caption(message: types.Message):
     zone = match.group('zone').strip()
     witag = match.group('witag_val').strip() if match.group('witag_val') else "Нет"
 
-    photo_file_id = message.photo[-1].file_id
-
-    # --- Валидация времени ---
+    # Валидация времени
     if not is_valid_time(start_time_str) or not is_valid_time(end_time_str):
         await message.reply("❌ Неверный формат времени (ЧЧ:ММ).")
         return
@@ -237,33 +279,20 @@ async def handle_photo_with_caption(message: types.Message):
         await message.reply("❌ Ошибка разбора времени. Проверьте формат ЧЧ:ММ.")
         return
 
-    # --- Проверка на пересечение смен ---
-    existing_shifts_sqlite = get_user_shifts_for_date_sqlite(user_id, shift_date)
-    existing_shifts_gsheets = get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date) if worksheet else []
-    existing_shifts = existing_shifts_sqlite + existing_shifts_gsheets
-
-    for existing_start_str, existing_end_str in existing_shifts:
-        existing_start_time = datetime.strptime(existing_start_str, '%H:%M').time()
-        existing_end_time = datetime.strptime(existing_end_str, '%H:%M').time()
-
-        if (new_start_time < existing_end_time) and (new_end_time > existing_start_time):
-            await message.reply(
-                f"❌ Вы уже записаны на смену, которая пересекается с этим временем "
-                f"({existing_start_str}-{existing_end_str}) на сегодня. "
-                f"Нельзя записываться на две совпадающие смены."
-            )
-            logging.info(f"Пользователь {user_full_name} (ID: {user_id}) пытался добавить пересекающуюся смену.")
-            return
-
-    # --- Добавление смены ---
+    # Сохраняем данные
+    photo_file_id = message.photo[-1].file_id
+    current_time = datetime.now(config['TIMEZONE'])
+    
     try:
         # Добавляем в SQLite
-        shift_id = add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
+        add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
+        
         # Добавляем в Google Sheets, если доступно
         if worksheet:
-            current_time_utc5 = datetime.now(GROUP_TIMEZONE).isoformat()
-            add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag, current_time_utc5)
-        logging.info(f"Смена для {full_name} на {shift_date} ({start_time_str}-{end_time_str}) успешно добавлена.")
+            add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, 
+                             start_time_str, end_time_str, zone, witag, current_time.isoformat())
+        
+        logger.info(f"Смена для {full_name} на {shift_date} ({start_time_str}-{end_time_str}) успешно добавлена.")
         await message.reply(
             f"✅ **{full_name}** записан на смену.\n"
             f"Дата: `{shift_date}`\n"
@@ -272,79 +301,122 @@ async def handle_photo_with_caption(message: types.Message):
             f"Witag: `{witag}`",
             parse_mode=ParseMode.MARKDOWN
         )
+        
+        # Обновляем активность
+        update_user_activity(user_id)
+        
     except Exception as e:
-        logging.error(f"Ошибка при добавлении смены для {full_name}: {e}", exc_info=True)
+        logger.error(f"Ошибка при добавлении смены: {e}", exc_info=True)
         await message.reply("❗️ Внутренняя ошибка. Попробуйте позже.")
 
-@dp.message_handler(commands=['report'])
-async def get_report(message: types.Message):
-    """Отчет по сменам для админов на текущую дату из Google Sheets."""
-    user_id = message.from_user.id
-    
-    if user_id not in ADMIN_IDS:
-        logging.warning(f"ID {user_id} пытался использовать /report.")
-        await message.reply("🚫 Команда только для авторизованных админов.")
+# --- Проверка активности ---
+async def check_activity():
+    while True:
+        current_shift = get_current_shift()
+        if not current_shift:
+            await asyncio.sleep(config['CHECK_INTERVAL'])
+            continue
+
+        inactive_users = get_inactive_users()
+        if inactive_users:
+            message = f"⚠️ <b>Неактивные пользователи ({current_shift} смена)</b>\n\n"
+            
+            for user_id, full_name, zone, last_activity in inactive_users:
+                last_time = last_activity.strftime('%H:%M:%S') if last_activity else "никогда"
+                message += f"• {full_name} ({zone}) - последняя активность: {last_time}\n"
+            
+            try:
+                await bot.send_message(config['REPORT_CHAT_ID'], message, parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Ошибка отправки сообщения: {e}")
+
+        await asyncio.sleep(config['CHECK_INTERVAL'])
+
+# --- Команда для проверки активности ---
+@dp.message_handler(commands=['activity'])
+async def check_activity_command(message: types.Message):
+    if message.from_user.id not in config['ADMIN_IDS']:
+        await message.reply("🚫 Команда только для администраторов.")
         return
 
-    logging.info(f"ID {user_id} запросил отчет.")
+    inactive_users = get_inactive_users()
+    if not inactive_users:
+        await message.reply("✅ Все сотрудники активны!")
+        return
 
-    today_date_str = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
-    shifts = get_shifts_for_date_gsheets(worksheet, today_date_str) if worksheet else get_shifts_for_date_sqlite(today_date_str)
+    response = "⚠️ <b>Неактивные сотрудники:</b>\n\n"
+    for user_id, full_name, zone, last_activity in inactive_users:
+        last_time = last_activity.strftime('%H:%M:%S') if last_activity else "никогда"
+        response += f"• {full_name} ({zone}) - последняя активность: {last_time}\n"
+    
+    await message.reply(response, parse_mode='HTML')
+
+# --- Команда для отчета ---
+@dp.message_handler(commands=['report'])
+async def get_report(message: types.Message):
+    if message.from_user.id not in config['ADMIN_IDS']:
+        await message.reply("🚫 Команда только для администраторов.")
+        return
+
+    today_date_str = datetime.now(config['TIMEZONE']).strftime('%d.%m.%y')
+    conn = sqlite3.connect('shifts.db')
+    cur = conn.cursor()
+    cur.execute("SELECT full_name, start_time, end_time, zone, witag FROM shifts WHERE shift_date = ?", (today_date_str,))
+    shifts = cur.fetchall()
+    conn.close()
 
     if not shifts:
         await message.reply(f"📄 На **{today_date_str}** смен не найдено.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    morning_shift_employees = []
-    evening_shift_employees = []
-    full_day_shift_employees = []
+    morning_shift = []
+    evening_shift = []
+    full_day_shift = []
 
-    # Сортируем смены по времени создания
-    sorted_shifts = sorted(shifts, key=lambda x: datetime.fromisoformat(x[5]) if worksheet else x[5])
-
-    for name, start, end, zone, witag, created_at_str in sorted_shifts:
-        created_dt = datetime.fromisoformat(created_at_str).astimezone(GROUP_TIMEZONE) if worksheet else datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S.%f%z')
-        created_time_display = created_dt.strftime('%H:%M')
-
-        shift_info = f"  - `{name}` ({zone}, Witag: {witag}) - Отправлено в {created_time_display}"
+    for name, start, end, zone, witag in shifts:
+        shift_info = f"  - `{name}` ({zone}, Witag: {witag})"
         if start == "07:00" and end == "15:00":
-            morning_shift_employees.append(shift_info)
+            morning_shift.append(shift_info)
         elif start == "15:00" and end == "23:00":
-            evening_shift_employees.append(shift_info)
+            evening_shift.append(shift_info)
         elif start == "07:00" and end == "23:00":
-            full_day_shift_employees.append(shift_info)
+            full_day_shift.append(shift_info)
 
-    total_employees = len(morning_shift_employees) + len(evening_shift_employees) + len(full_day_shift_employees)
+    total = len(morning_shift) + len(evening_shift) + len(full_day_shift)
 
-    report_text = [f"**📊 Отчет на {today_date_str}**\n"]
-    report_text.append(f"**Общее количество людей: {total_employees}**\n")
+    report = [
+        f"**📊 Отчет на {today_date_str}**",
+        f"**Общее количество: {total}**\n",
+        f"**☀️ Утренняя смена (07:00-15:00): {len(morning_shift)}**"
+    ] + morning_shift + [
+        "\n**🌙 Вечерняя смена (15:00-23:00): {len(evening_shift)}**"
+    ] + evening_shift + [
+        "\n**🌞 Полный день (07:00-23:00): {len(full_day_shift)}**"
+    ] + full_day_shift
 
-    if morning_shift_employees:
-        report_text.append(f"**☀️ Утренняя смена (07:00 - 15:00): {len(morning_shift_employees)} чел.**")
-        report_text.extend(morning_shift_employees)
-    else:
-        report_text.append("**☀️ Утренняя смена (07:00 - 15:00): 0 чел.**\n  - *Нет сотрудников*")
-    
-    report_text.append("\n")
-    
-    if evening_shift_employees:
-        report_text.append(f"**🌙 Вечерняя смена (15:00 - 23:00): {len(evening_shift_employees)} чел.**")
-        report_text.extend(evening_shift_employees)
-    else:
-        report_text.append("**🌙 Вечерняя смена (15:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
-
-    report_text.append("\n")
-
-    if full_day_shift_employees:
-        report_text.append(f"**🗓️ Целый день (07:00 - 23:00): {len(full_day_shift_employees)} чел.**")
-        report_text.extend(full_day_shift_employees)
-    else:
-        report_text.append("**🗓️ Целый день (07:00 - 23:00): 0 чел.**\n  - *Нет сотрудников*")
-
-    await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
+    await message.reply("\n".join(report), parse_mode=ParseMode.MARKDOWN)
 
 # --- Запуск бота ---
+async def on_startup(_):
+    asyncio.create_task(check_activity())
+    try:
+        await bot.send_message(config['ADMIN_IDS'][0], '🤖 Бот запущен и начал мониторинг')
+    except:
+        pass
+
 if __name__ == '__main__':
-    init_db()
-    logging.info("Бот запущен...")
-    executor.start_polling(dp, skip_updates=True)
+    lock_fd = acquire_lock()
+    try:
+        executor.start_polling(
+            dp,
+            on_startup=on_startup,
+            skip_updates=True
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        try:
+            os.remove('bot.lock')
+        except:
+            pass
+        logger.info('Бот завершил работу')
