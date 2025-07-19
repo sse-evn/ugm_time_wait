@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import fcntl
 import sys
+import asyncio
 from datetime import datetime, time, timedelta
 from typing import Dict, List
 import pytz
@@ -14,17 +15,16 @@ from aiogram.types import ParseMode
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-# --- Конфигурация ---
 load_dotenv()
 
-# Проверка обязательных переменных
 required_vars = [
     'BOT_TOKEN',
     'ZONE_A_CHAT_ID',
     'ZONE_B_CHAT_ID',
     'REPORT_CHAT_ID',
     'ADMIN_IDS',
-    'GOOGLE_SHEETS_CREDENTIALS_PATH'
+    'GOOGLE_SHEETS_CREDENTIALS_PATH',
+    'GOOGLE_SHEETS_ID'
 ]
 
 for var in required_vars:
@@ -32,7 +32,6 @@ for var in required_vars:
         logging.error(f'❌ Отсутствует переменная: {var}')
         exit(1)
 
-# Настройки бота
 config = {
     'BOT_TOKEN': os.getenv('BOT_TOKEN'),
     'ZONE_A_CHAT_ID': int(os.getenv('ZONE_A_CHAT_ID')),
@@ -40,18 +39,18 @@ config = {
     'REPORT_CHAT_ID': int(os.getenv('REPORT_CHAT_ID')),
     'ADMIN_IDS': list(map(int, os.getenv('ADMIN_IDS').split(','))),
     'TIMEZONE': pytz.timezone(os.getenv('TIMEZONE', 'Asia/Almaty')),
-    'CHECK_INTERVAL': int(os.getenv('CHECK_INTERVAL', '300')),  # 5 минут по умолчанию
-    'INACTIVITY_THRESHOLD': int(os.getenv('INACTIVITY_THRESHOLD', '1800')),  # 30 минут по умолчанию
+    'CHECK_INTERVAL': int(os.getenv('CHECK_INTERVAL', '300')),
+    'INACTIVITY_THRESHOLD': int(os.getenv('INACTIVITY_THRESHOLD', '1800')),
     'MORNING_SHIFT': (int(os.getenv('MORNING_SHIFT_START', '7')), int(os.getenv('MORNING_SHIFT_END', '15'))),
     'EVENING_SHIFT': (int(os.getenv('EVENING_SHIFT_START', '15')), int(os.getenv('EVENING_SHIFT_END', '23'))),
     'ZONE_NAMES': {
         'A': os.getenv('ZONE_A_NAME', 'Отчёты скаутов Е.О.М'),
         'B': os.getenv('ZONE_B_NAME', '10 аумақ-зона')
     },
-    'GOOGLE_SHEETS_ID': os.getenv('GOOGLE_SHEETS_ID', '1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE')
+    'GOOGLE_SHEETS_CREDENTIALS_PATH': os.getenv('GOOGLE_SHEETS_CREDENTIALS_PATH'),
+    'GOOGLE_SHEETS_ID': os.getenv('GOOGLE_SHEETS_ID')
 }
 
-# --- Настройка логирования ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -62,7 +61,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Блокировка файла для предотвращения дублирования ---
 def acquire_lock():
     lock_file = 'bot.lock'
     try:
@@ -73,7 +71,6 @@ def acquire_lock():
         logger.error('❌ Бот уже запущен! Завершаю работу.')
         sys.exit(1)
 
-# --- Инициализация Google Sheets ---
 def init_google_sheets():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
@@ -86,7 +83,6 @@ def init_google_sheets():
         logger.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True)
         return None
 
-# --- Инициализация SQLite ---
 def init_db():
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -108,7 +104,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- Добавление смены в SQLite ---
 def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -120,7 +115,6 @@ def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone,
     conn.commit()
     conn.close()
 
-# --- Обновление времени последней активности ---
 def update_user_activity(user_id):
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -133,7 +127,6 @@ def update_user_activity(user_id):
     conn.commit()
     conn.close()
 
-# --- Получение активных пользователей ---
 def get_active_users():
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -150,7 +143,6 @@ def get_active_users():
     conn.close()
     return active_users
 
-# --- Получение неактивных пользователей ---
 def get_inactive_users():
     conn = sqlite3.connect('shifts.db')
     cur = conn.cursor()
@@ -167,7 +159,6 @@ def get_inactive_users():
     conn.close()
     return inactive_users
 
-# --- Инициализация бота ---
 try:
     bot = Bot(token=config['BOT_TOKEN'])
     storage = MemoryStorage()
@@ -177,11 +168,9 @@ except Exception as e:
     logger.error(f"❌ Ошибка инициализации бота: {e}")
     exit(1)
 
-# --- Глобальные переменные ---
 worksheet = init_google_sheets()
 init_db()
 
-# --- Вспомогательные функции ---
 def get_current_shift() -> str:
     now = datetime.now(config['TIMEZONE']).hour
     if config['MORNING_SHIFT'][0] <= now < config['MORNING_SHIFT'][1]:
@@ -197,7 +186,6 @@ def is_valid_time(time_str, fmt='%H:%M'):
     except ValueError:
         return False
 
-# --- Обработчики сообщений ---
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
     await message.reply(
@@ -220,7 +208,6 @@ async def handle_photo_with_caption(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Проверяем, что сообщение в нужном чате
     if chat_id not in [config['ZONE_A_CHAT_ID'], config['ZONE_B_CHAT_ID']]:
         return
 
@@ -233,7 +220,6 @@ async def handle_photo_with_caption(message: types.Message):
 
     shift_date = datetime.now(config['TIMEZONE']).strftime('%d.%m.%y')
 
-    # Парсинг подписи
     pattern = re.compile(
         r'^(?P<name>[\w\sА-Яа-я]+)\s+'
         r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\s+'
@@ -263,7 +249,6 @@ async def handle_photo_with_caption(message: types.Message):
     zone = match.group('zone').strip()
     witag = match.group('witag_val').strip() if match.group('witag_val') else "Нет"
 
-    # Валидация времени
     if not is_valid_time(start_time_str) or not is_valid_time(end_time_str):
         await message.reply("❌ Неверный формат времени (ЧЧ:ММ).")
         return
@@ -279,15 +264,12 @@ async def handle_photo_with_caption(message: types.Message):
         await message.reply("❌ Ошибка разбора времени. Проверьте формат ЧЧ:ММ.")
         return
 
-    # Сохраняем данные
     photo_file_id = message.photo[-1].file_id
     current_time = datetime.now(config['TIMEZONE'])
     
     try:
-        # Добавляем в SQLite
         add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
         
-        # Добавляем в Google Sheets, если доступно
         if worksheet:
             add_shift_gsheets(worksheet, user_id, full_name, photo_file_id, shift_date, 
                              start_time_str, end_time_str, zone, witag, current_time.isoformat())
@@ -302,14 +284,12 @@ async def handle_photo_with_caption(message: types.Message):
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Обновляем активность
         update_user_activity(user_id)
         
     except Exception as e:
         logger.error(f"Ошибка при добавлении смены: {e}", exc_info=True)
         await message.reply("❗️ Внутренняя ошибка. Попробуйте позже.")
 
-# --- Проверка активности ---
 async def check_activity():
     while True:
         current_shift = get_current_shift()
@@ -332,7 +312,6 @@ async def check_activity():
 
         await asyncio.sleep(config['CHECK_INTERVAL'])
 
-# --- Команда для проверки активности ---
 @dp.message_handler(commands=['activity'])
 async def check_activity_command(message: types.Message):
     if message.from_user.id not in config['ADMIN_IDS']:
@@ -351,7 +330,6 @@ async def check_activity_command(message: types.Message):
     
     await message.reply(response, parse_mode='HTML')
 
-# --- Команда для отчета ---
 @dp.message_handler(commands=['report'])
 async def get_report(message: types.Message):
     if message.from_user.id not in config['ADMIN_IDS']:
@@ -396,13 +374,12 @@ async def get_report(message: types.Message):
 
     await message.reply("\n".join(report), parse_mode=ParseMode.MARKDOWN)
 
-# --- Запуск бота ---
 async def on_startup(_):
     asyncio.create_task(check_activity())
     try:
         await bot.send_message(config['ADMIN_IDS'][0], '🤖 Бот запущен и начал мониторинг')
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления: {e}")
 
 if __name__ == '__main__':
     lock_fd = acquire_lock()
