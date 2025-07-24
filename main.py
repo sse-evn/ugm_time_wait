@@ -48,12 +48,10 @@ def init_google_sheets():
         spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
         logging.info("Успешно подключились к Google Sheets!")
         
-        # Проверяем наличие листа Report, создаем если отсутствует
         try:
             report_worksheet = spreadsheet.worksheet("Report")
         except gspread.exceptions.WorksheetNotFound:
             report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
-            # Форматируем заголовки
             report_worksheet.update('A1:E1', [['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
             set_row_height(report_worksheet, '1', 40)
             set_column_width(report_worksheet, 'A:E', 120)
@@ -116,15 +114,12 @@ def delete_shift_sqlite(shift_id):
 # --- Добавление смены в Google Sheets ---
 def add_shift_gsheets(worksheet, report_worksheet, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at):
     try:
-        # Добавляем в Sheet1
         rows = worksheet.get_all_values()
         next_id = len(rows)  # ID = количество строк (заголовок + данные)
         worksheet.append_row([
             next_id, user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag, created_at
         ])
         logging.info(f"Смена для {full_name} добавлена в Google Sheets (Sheet1).")
-        
-        # Обновляем Report лист
         update_report_worksheet(report_worksheet)
     except Exception as e:
         logging.error(f"Ошибка при добавлении в Google Sheets: {e}", exc_info=True)
@@ -134,7 +129,7 @@ def delete_shift_gsheets(worksheet, report_worksheet, shift_id):
     try:
         rows = worksheet.get_all_values()
         for i, row in enumerate(rows[1:], start=2):  # Пропускаем заголовок
-            if int(row[0]) == shift_id:  # ID в первом столбце
+            if int(row[0]) == shift_id:
                 worksheet.delete_rows(i)
                 logging.info(f"Смена с ID {shift_id} удалена из Google Sheets.")
                 update_report_worksheet(report_worksheet)
@@ -151,20 +146,6 @@ def update_report_worksheet(report_worksheet):
         if not shifts:
             return
         
-        # Группировка по датам
-        shifts_by_date = defaultdict(list)
-        for shift in shifts:
-            user_id, full_name, shift_date, start_time, end_time, zone, witag, created_at = shift
-            shifts_by_date[shift_date].append({
-                'full_name': full_name,
-                'start_time': start_time,
-                'end_time': end_time,
-                'zone': zone,
-                'witag': witag,
-                'created_at': created_at
-            })
-        
-        # Очищаем Report лист (кроме заголовков)
         report_worksheet.clear()
         report_worksheet.update('A1:E1', [['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
         set_row_height(report_worksheet, '1', 40)
@@ -176,22 +157,9 @@ def update_report_worksheet(report_worksheet):
         )
         format_cell_range(report_worksheet, 'A1:E1', fmt)
         
-        # Заполняем данными
         row_index = 2
-        for shift_date in sorted(shifts_by_date.keys(), reverse=True):
-            report_worksheet.update(f'A{row_index}', [[shift_date]])
-            fmt = CellFormat(textFormat=TextFormat(bold=True))
-            format_cell_range(report_worksheet, f'A{row_index}', fmt)
-            row_index += 1
-            
-            for shift in sorted(shifts_by_date[shift_date], key=lambda x: datetime.fromisoformat(x['created_at'])):
-                report_worksheet.update(f'A{row_index}:E{row_index}', [[
-                    '', shift['full_name'], f"{shift['start_time']}-{shift['end_time']}", shift['zone'], shift['witag']
-                ]])
-                row_index += 1
-            
-            row_index += 1  # Пустая строка между датами
-        
+        for shift in shifts:
+            report_worksheet.append_row([shift[4], shift[2], f"{shift[5]}-{shift[6]}", shift[7], shift[8]])
         logging.info("Лист Report обновлен.")
     except Exception as e:
         logging.error(f"Ошибка при обновлении листа Report: {e}", exc_info=True)
@@ -232,7 +200,7 @@ def get_user_shifts_gsheets(worksheet, user_id):
         rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
         shifts = []
         for row in rows:
-            if int(row[1]) == user_id:  # user_id
+            if int(row[1]) == user_id:
                 shifts.append((int(row[0]), row[2], row[4], row[5], row[6], row[7], row[8], row[9]))  # id, full_name, shift_date, start_time, end_time, zone, witag, created_at
         return shifts
     except Exception as e:
@@ -254,7 +222,7 @@ def get_today_shifts_gsheets(worksheet, today_date):
         rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
         shifts = []
         for row in rows:
-            if row[4] == today_date:  # shift_date
+            if row[4] == today_date:
                 shifts.append((int(row[1]), row[2], row[4], row[5], row[6], row[7], row[8], row[9]))  # user_id, full_name, shift_date, start_time, end_time, zone, witag, created_at
         return shifts
     except Exception as e:
@@ -276,7 +244,7 @@ def get_user_shifts_for_date_gsheets(worksheet, user_id, shift_date):
         rows = worksheet.get_all_values()[1:]  # Пропускаем заголовок
         shifts = []
         for row in rows:
-            if int(row[1]) == user_id and row[4] == shift_date:  # user_id и shift_date
+            if int(row[1]) == user_id and row[4] == shift_date:
                 shifts.append((row[5], row[6]))  # start_time, end_time
         return shifts
     except Exception as e:
@@ -321,7 +289,8 @@ async def send_welcome(message: types.Message):
         "- /today - Смены за сегодня\n"
         "- /report - Полный отчет (админы)\n"
         "- /delete_shift [ID] - Удалить смену (админы)\n"
-        "- /stats - Статистика по сменам (админы)",
+        "- /stats - Статистика по сменам (админы)\n"
+        "- /admin_panel - Панель админа для редактирования (админы)",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -402,17 +371,14 @@ async def handle_photo_with_caption(message: types.Message):
         if (new_start_time < existing_end_time) and (new_end_time > existing_start_time):
             await message.reply(
                 f"❌ Вы уже записаны на смену, которая пересекается с этим временем "
-                f"({existing_start_str}-{existing_end_str}) на сегодня. "
-                f"Нельзя записываться на две совпадающие смены."
+                f"({existing_start_str}-{existing_end_str}) на сегодня."
             )
             logging.info(f"Пользователь {user_full_name} (ID: {user_id}) пытался добавить пересекающуюся смену.")
             return
 
     # --- Добавление смены ---
     try:
-        # Добавляем в SQLite
         shift_id = add_shift_sqlite(user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag)
-        # Добавляем в Google Sheets, если доступно
         if worksheet and report_worksheet:
             current_time_utc5 = datetime.now(GROUP_TIMEZONE).isoformat()
             add_shift_gsheets(worksheet, report_worksheet, user_id, full_name, photo_file_id, shift_date, start_time_str, end_time_str, zone, witag, current_time_utc5)
@@ -435,13 +401,11 @@ async def get_my_shifts(message: types.Message):
     user_id = message.from_user.id
     logging.info(f"ID {user_id} запросил свои смены.")
 
-    # Получаем смены пользователя
     shifts = get_user_shifts_gsheets(worksheet, user_id) if worksheet else get_user_shifts_sqlite(user_id)
     if not shifts:
         await message.reply("📄 У вас нет записанных смен.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Группировка по датам
     shifts_by_date = defaultdict(list)
     for shift in shifts:
         shift_id, full_name, shift_date, start_time, end_time, zone, witag, created_at = shift
@@ -462,7 +426,6 @@ async def get_my_shifts(message: types.Message):
             'shift_type': shift_type
         })
 
-    # Формирование отчета
     report_text = [f"**📋 Ваши смены, {message.from_user.full_name}**"]
     
     for shift_date in sorted(shifts_by_date.keys(), reverse=True):
@@ -500,10 +463,7 @@ async def delete_shift(message: types.Message):
     shift_id = int(args)
     logging.info(f"ID {user_id} запросил удаление смены с ID {shift_id}.")
 
-    # Удаляем из SQLite
     sqlite_success = delete_shift_sqlite(shift_id)
-    
-    # Удаляем из Google Sheets
     gsheets_success = delete_shift_gsheets(worksheet, report_worksheet, shift_id) if worksheet and report_worksheet else False
 
     if sqlite_success or gsheets_success:
@@ -517,7 +477,6 @@ async def get_today_shifts(message: types.Message):
     today_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
     logging.info(f"ID {message.from_user.id} запросил смены за {today_date}.")
 
-    # Получаем смены за сегодня
     shifts = get_today_shifts_gsheets(worksheet, today_date) if worksheet else get_today_shifts_sqlite(today_date)
     if not shifts:
         await message.reply(f"📄 На **{today_date}** смен не найдено.", parse_mode=ParseMode.MARKDOWN)
@@ -556,23 +515,19 @@ async def get_stats(message: types.Message):
 
     logging.info(f"ID {user_id} запросил статистику.")
 
-    # Получаем все смены
     shifts = get_all_shifts_gsheets(worksheet) if worksheet else get_all_shifts_sqlite()
     if not shifts:
         await message.reply("📄 Смены не найдены.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Подсчет смен по сотрудникам и зонам
     shift_counts = defaultdict(int)
     zone_counts = defaultdict(int)
     for shift in shifts:
         shift_counts[shift[1]] += 1  # full_name
         zone_counts[shift[5]] += 1   # zone
 
-    # Формирование отчета
     report_text = ["**📈 Статистика по сменам**"]
     
-    # Статистика по сотрудникам
     report_text.append("\n**👷 Сотрудники**")
     report_text.append("```")
     report_text.append("| Имя              | Кол-во смен |")
@@ -581,7 +536,6 @@ async def get_stats(message: types.Message):
         report_text.append(f"| {name:<16} | {count:<11} |")
     report_text.append("```")
 
-    # Статистика по зонам
     report_text.append("\n**📍 Зоны**")
     report_text.append("```")
     report_text.append("| Зона      | Кол-во смен |")
@@ -595,7 +549,7 @@ async def get_stats(message: types.Message):
 
 @dp.message_handler(commands=['report'])
 async def get_report(message: types.Message):
-    """Отчет по сменам для админов с группировкой по датам и статистикой по сотрудникам."""
+    """Отчет по сменам для админов в табличном формате с колонками по сотрудникам."""
     user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
@@ -605,67 +559,135 @@ async def get_report(message: types.Message):
 
     logging.info(f"ID {user_id} запросил отчет.")
 
-    # Получаем все смены
     shifts = get_all_shifts_gsheets(worksheet) if worksheet else get_all_shifts_sqlite()
     if not shifts:
         await message.reply("📄 Смены не найдены.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Группировка смен по датам
-    shifts_by_date = defaultdict(list)
+    shifts_by_user = defaultdict(list)
     for shift in shifts:
         user_id, full_name, shift_date, start_time, end_time, zone, witag, created_at = shift
-        shift_type = (
-            "☀️ Утро" if start_time == "07:00" and end_time == "15:00" else
-            "🌙 Вечер" if start_time == "15:00" and end_time == "23:00" else
-            "🗓️ Полный день" if start_time == "07:00" and end_time == "23:00" else
-            "⏰ Другое"
-        )
-        shifts_by_date[shift_date].append({
-            'user_id': user_id,
-            'full_name': full_name,
+        shifts_by_user[full_name].append({
+            'shift_date': shift_date,
             'start_time': start_time,
             'end_time': end_time,
             'zone': zone,
             'witag': witag,
-            'created_at': created_at,
-            'shift_type': shift_type
+            'created_at': created_at
         })
 
-    # Подсчет смен по сотрудникам
-    shift_counts = defaultdict(int)
-    for shift in shifts:
-        shift_counts[shift[1]] += 1  # full_name
-
-    # Формирование отчета
-    report_text = ["**📊 Отчет по сменам**"]
+    unique_dates = sorted(set(shift['shift_date'] for user_shifts in shifts_by_user.values() for shift in user_shifts), reverse=True)
     
-    # Сортировка дат в порядке убывания (от новых к старым)
-    for shift_date in sorted(shifts_by_date.keys(), reverse=True):
-        report_text.append(f"\n**📅 {shift_date}**")
-        report_text.append("```")
-        report_text.append("| Тип смены       | Имя              | Время        | Зона      | Witag |")
-        report_text.append("|-----------------|------------------|--------------|-----------|-------|")
-        
-        for shift in sorted(shifts_by_date[shift_date], key=lambda x: datetime.fromisoformat(x['created_at']) if worksheet else x['created_at']):
-            report_text.append(
-                f"| {shift['shift_type']:<15} | {shift['full_name']:<16} | {shift['start_time']}-{shift['end_time']} | {shift['zone']:<9} | {shift['witag']:<5} |"
-            )
-        
-        report_text.append("```")
-        report_text.append(f"**Всего смен: {len(shifts_by_date[shift_date])}**")
-
-    # Статистика по сотрудникам
-    report_text.append("\n**📈 Статистика по сотрудникам**")
+    report_text = ["**📊 Отчет по сменам**"]
     report_text.append("```")
-    report_text.append("| Имя              | Кол-во смен |")
-    report_text.append("|------------------|-------------|")
-    for name, count in sorted(shift_counts.items()):
-        report_text.append(f"| {name:<16} | {count:<11} |")
-    report_text.append("```")
+    
+    headers = ["Дата"] + [name for name in shifts_by_user.keys()]
+    report_text.append("| " + " | ".join(headers) + " |")
+    report_text.append("| " + " | ".join(["-" * 10] * (len(headers))) + " |")
 
+    for date in unique_dates:
+        row = [date]
+        for name in headers[1:]:
+            user_shifts = [s for s in shifts_by_user[name] if s['shift_date'] == date]
+            if user_shifts:
+                times = []
+                for shift in user_shifts:
+                    times.append(f"{shift['start_time']}-{shift['end_time']}")
+                sequence = " ".join(times[:7] + [""] * (7 - len(times))) if times else ""
+                row.append(sequence)
+            else:
+                row.append("")
+        report_text.append("| " + " | ".join(row) + " |")
+
+    report_text.append("```")
     report_text.append(f"\n**Общее количество смен: {len(shifts)}**")
     await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message_handler(commands=['admin_panel'])
+async def admin_panel(message: types.Message):
+    """Панель админа для управления сменами."""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        logging.warning(f"ID {user_id} пытался использовать /admin_panel.")
+        await message.reply("🚫 Команда только для авторизованных админов.")
+        return
+
+    logging.info(f"ID {user_id} открыл админ-панель.")
+
+    shifts = get_all_shifts_gsheets(worksheet) if worksheet else get_all_shifts_sqlite()
+    if not shifts:
+        await message.reply("📄 Смены не найдены.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    report_text = ["**📋 Админ-панель**"]
+    report_text.append("Список смен для редактирования:")
+    report_text.append("```")
+    report_text.append("| ID | Имя          | Дата   | Время       | Зона   | Действие       |")
+    report_text.append("|----|--------------|--------|-------------|--------|----------------|")
+    
+    for shift in shifts:
+        shift_id, full_name, shift_date, start_time, end_time, zone, witag, created_at = shift
+        report_text.append(f"| {shift_id:<2} | {full_name[:12]:<12} | {shift_date} | {start_time}-{end_time} | {zone} | /edit_{shift_id} |")
+    
+    report_text.append("```")
+    report_text.append("Команды:\n- /edit_[ID] - Редактировать смену (например, /edit_1)\n- Укажите 'Home' в ответе, чтобы отправить домой.")
+    await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message_handler(lambda message: message.text.startswith('/edit_'))
+async def edit_shift_with_state(message: types.Message):
+    """Редактирование смены админом с установкой состояния."""
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        logging.warning(f"ID {user_id} пытался использовать /edit_.")
+        await message.reply("🚫 Команда только для авторизованных админов.")
+        return
+
+    try:
+        shift_id = int(message.text.split('_')[1])
+        message.expected_shift_id = shift_id  # Устанавливаем состояние
+        logging.info(f"ID {user_id} запросил редактирование смены с ID {shift_id}.")
+        await message.reply("📝 Введите новое время (ЧЧ:ММ-ЧЧ:ММ) или 'Home' для отправки домой:", parse_mode=ParseMode.MARKDOWN)
+    except ValueError:
+        await message.reply("❌ Неверный ID смены.", parse_mode=ParseMode.MARKDOWN)
+
+@dp.message_handler(content_types=['text'], state=None)
+async def process_edit_input(message: types.Message):
+    user_id = message.from_user.id
+    
+    if user_id not in ADMIN_IDS or not hasattr(message, 'expected_shift_id'):
+        return
+
+    shift_id = message.expected_shift_id
+    text = message.text.strip()
+    logging.info(f"ID {user_id} вводит данные для редактирования смены {shift_id}.")
+
+    if text == "Home":
+        if delete_shift_sqlite(shift_id) or (worksheet and delete_shift_gsheets(worksheet, report_worksheet, shift_id)):
+            await message.reply(f"✅ Смена с ID {shift_id} удалена (сотрудник отправлен домой).", parse_mode=ParseMode.MARKDOWN)
+            update_report_worksheet(report_worksheet) if worksheet else None
+        else:
+            await message.reply(f"❌ Смена с ID {shift_id} не найдена.", parse_mode=ParseMode.MARKDOWN)
+    elif is_valid_time(text.split('-')[0]) and is_valid_time(text.split('-')[1]):
+        conn = sqlite3.connect('shifts.db')
+        cur = conn.cursor()
+        cur.execute("UPDATE shifts SET start_time = ?, end_time = ? WHERE id = ?", (text.split('-')[0], text.split('-')[1], shift_id))
+        conn.commit()
+        conn.close()
+        if worksheet:
+            rows = worksheet.get_all_values()[1:]
+            for i, row in enumerate(rows, start=2):
+                if int(row[0]) == shift_id:
+                    worksheet.update_cell(i, 6, text.split('-')[0])
+                    worksheet.update_cell(i, 7, text.split('-')[1])
+                    break
+            update_report_worksheet(report_worksheet)
+        await message.reply(f"✅ Смена с ID {shift_id} обновлена на {text}.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await message.reply("❌ Неверный формат времени (ЧЧ:ММ-ЧЧ:ММ) или значение 'Home'.", parse_mode=ParseMode.MARKDOWN)
+
+    del message.expected_shift_id
 
 # --- Запуск бота ---
 if __name__ == '__main__':
