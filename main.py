@@ -40,13 +40,13 @@ def init_google_sheets():
     creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
+    sheet_list = [s.title for s in spreadsheet.worksheets()]
 
-    # ---- REPORT лист ----
-    try:
+    if "Report" in sheet_list:
         report_worksheet = spreadsheet.worksheet("Report")
-    except gspread.exceptions.WorksheetNotFound:
+    else:
         report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
-        report_worksheet.update([['Дата', 'Имя', 'Время', 'Зона', 'Witag']], 'A1:E1')
+        report_worksheet.update('A1:E1', [['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
         set_row_height(report_worksheet, '1', 40)
         set_column_width(report_worksheet, 'A:E', 120)
         fmt = CellFormat(
@@ -56,29 +56,22 @@ def init_google_sheets():
         )
         format_cell_range(report_worksheet, 'A1:E1', fmt)
 
-    # ---- TIMESHEET лист ----
-    try:
+    if "Timesheet" in sheet_list:
         timesheet_worksheet = spreadsheet.worksheet("Timesheet")
-    except gspread.exceptions.WorksheetNotFound:
+    else:
         timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=31)
         headers = ["Сотрудник"] + [str(i) for i in range(1, 32)] + ["Итого"]
-        timesheet_worksheet.update([headers], 'A1:AF1')
+        timesheet_worksheet.update('A1:AF1', [headers])
         set_column_width(timesheet_worksheet, 'A:AF', 60)
-        fmt = CellFormat(
-            backgroundColor=Color(0.9, 0.9, 0.9),
-            textFormat=TextFormat(bold=True),
-            horizontalAlignment='CENTER'
-        )
         format_cell_range(timesheet_worksheet, 'A1:AF1', fmt)
 
-    # ---- Sheet1 (основной) ----
-    try:
+    # Sheet1 на всякий случай
+    if "Sheet1" in sheet_list:
         worksheet = spreadsheet.worksheet("Sheet1")
-    except gspread.exceptions.WorksheetNotFound:
+    else:
         worksheet = spreadsheet.add_worksheet(title="Sheet1", rows=100, cols=10)
 
     return worksheet, report_worksheet, timesheet_worksheet
-
 
 def init_db():
     conn = sqlite3.connect('shifts.db')
