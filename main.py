@@ -25,16 +25,9 @@ GOOGLE_SHEETS_ID = "1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE"
 
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
 if ADMIN_IDS_STR:
-    try:
-        ADMIN_IDS = {int(uid.strip()) for uid in ADMIN_IDS_STR.split(',')}
-    except ValueError:
-        logging.error("ADMIN_IDS parse error")
-        ADMIN_IDS = set()
+    ADMIN_IDS = {int(uid.strip()) for uid in ADMIN_IDS_STR.split(',')}
 else:
     ADMIN_IDS = set()
-
-if not ADMIN_IDS:
-    logging.warning("ADMIN_IDS not set")
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -44,38 +37,33 @@ dp = Dispatcher(bot, storage=storage)
 
 def init_google_sheets():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
+    
     try:
-        creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
-        logging.info("Connected to Google Sheets")
+        report_worksheet = spreadsheet.worksheet("Report")
+        timesheet_worksheet = spreadsheet.worksheet("Timesheet")
+    except gspread.exceptions.WorksheetNotFound:
+        report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
+        timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=31)
         
-        try:
-            report_worksheet = spreadsheet.worksheet("Report")
-            timesheet_worksheet = spreadsheet.worksheet("Timesheet")
-        except gspread.exceptions.WorksheetNotFound:
-            report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
-            timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=31)
-            
-            report_worksheet.update('A1:E1', [['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
-            set_row_height(report_worksheet, '1', 40)
-            set_column_width(report_worksheet, 'A:E', 120)
-            fmt = CellFormat(
-                backgroundColor=Color(0.9, 0.9, 0.9),
-                textFormat=TextFormat(bold=True),
-                horizontalAlignment='CENTER'
-            )
-            format_cell_range(report_worksheet, 'A1:E1', fmt)
-            
-            headers = ["Сотрудник"] + [str(i) for i in range(1, 32)] + ["Итого"]
-            timesheet_worksheet.update('A1:AF1', [headers])
-            set_column_width(timesheet_worksheet, 'A:AF', 60)
-            format_cell_range(timesheet_worksheet, 'A1:AF1', fmt)
+        report_worksheet.update([['Дата', 'Имя', 'Время', 'Зона', 'Witag']], 'A1:E1')
+        set_row_height(report_worksheet, '1', 40)
+        set_column_width(report_worksheet, 'A:E', 120)
+        fmt = CellFormat(
+            backgroundColor=Color(0.9, 0.9, 0.9),
+            textFormat=TextFormat(bold=True),
+            horizontalAlignment='CENTER'
+        )
+        format_cell_range(report_worksheet, 'A1:E1', fmt)
         
-        return spreadsheet.worksheet("Sheet1"), report_worksheet, timesheet_worksheet
-    except Exception as e:
-        logging.error(f"Google Sheets error: {e}")
-        raise
+        headers = ["Сотрудник"] + [str(i) for i in range(1, 32)] + ["Итого"]
+        timesheet_worksheet.update([headers], 'A1:AF1')
+        set_column_width(timesheet_worksheet, 'A:AF', 60)
+        format_cell_range(timesheet_worksheet, 'A1:AF1', fmt)
+    
+    return spreadsheet.worksheet("Sheet1"), report_worksheet, timesheet_worksheet
 
 def init_db():
     conn = sqlite3.connect('shifts.db')
@@ -109,8 +97,9 @@ def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (user_id, full_name, photo_id, s_date, s_time, e_time, None, None, zone, witag, current_time_utc5))
     conn.commit()
+    shift_id = cur.lastrowid
     conn.close()
-    return cur.lastrowid
+    return shift_id
 
 def update_shift_status(shift_id, status):
     conn = sqlite3.connect('shifts.db')
