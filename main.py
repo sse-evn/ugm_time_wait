@@ -40,34 +40,43 @@ def init_google_sheets():
     creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
-    
-    fmt = CellFormat(
-        backgroundColor=Color(0.9, 0.9, 0.9),
-        textFormat=TextFormat(bold=True),
-        horizontalAlignment='CENTER'
-    )
 
-    # Получаем или создаём Report
+    # Создание или получение листа "Report"
     try:
         report_worksheet = spreadsheet.worksheet("Report")
     except gspread.exceptions.WorksheetNotFound:
         report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
-        report_worksheet.update('A1:E1', [['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
+        report_worksheet.update(range_name="A1:E1", values=[['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
         set_row_height(report_worksheet, '1', 40)
         set_column_width(report_worksheet, 'A:E', 120)
+        fmt = CellFormat(
+            backgroundColor=Color(0.9, 0.9, 0.9),
+            textFormat=TextFormat(bold=True),
+            horizontalAlignment='CENTER'
+        )
         format_cell_range(report_worksheet, 'A1:E1', fmt)
 
-    # Получаем или создаём Timesheet
+    # Создание или получение листа "Timesheet"
     try:
         timesheet_worksheet = spreadsheet.worksheet("Timesheet")
     except gspread.exceptions.WorksheetNotFound:
-        timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=31)
+        timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=40)
+        
         headers = ["Сотрудник"] + [str(i) for i in range(1, 32)] + ["Итого"]
-        timesheet_worksheet.update('A1:AF1', [headers])
-        set_column_width(timesheet_worksheet, 'A:AF', 60)
-        format_cell_range(timesheet_worksheet, 'A1:AF1', fmt)
-
-    # Получаем или создаём Sheet1
+        column_count = len(headers)  # 34
+        end_column_letter = chr(ord('A') + column_count - 1)  # AH
+        range_str = f"A1:{end_column_letter}1"
+        
+        timesheet_worksheet.update(range_name=range_str, values=[headers])
+        set_column_width(timesheet_worksheet, f"A:{end_column_letter}", 60)
+        fmt = CellFormat(
+            backgroundColor=Color(0.9, 0.9, 0.9),
+            textFormat=TextFormat(bold=True),
+            horizontalAlignment='CENTER'
+        )
+        format_cell_range(timesheet_worksheet, range_str, fmt)
+    
+    # Получаем "Sheet1", если нужен
     try:
         worksheet = spreadsheet.worksheet("Sheet1")
     except gspread.exceptions.WorksheetNotFound:
