@@ -1,514 +1,479 @@
-import os
-import re
-import sqlite3
-import logging
-from datetime import datetime, timedelta
-import pytz
-import gspread
-from google.oauth2.service_account import Credentials
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.dispatcher import FSMContext
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from dotenv import load_dotenv
-from collections import defaultdict
-from gspread_formatting import *
+require('dotenv').config();
+const sqlite3 = require('sqlite3').verbose();
+const { Telegraf, Markup } = require('telegraf');
+const { format } = require('date-fns');
+const { utcToZonedTime } = require('date-fns-tz');
+const winston = require('winston');
 
-load_dotenv()
-API_TOKEN = os.getenv("BOT_TOKEN")
-if not API_TOKEN:
-    logging.error("BOT_TOKEN is not set")
-    raise ValueError("BOT_TOKEN is not set")
-logging.info(f"Loaded BOT_TOKEN: {API_TOKEN[:10]}...")
-GROUP_TIMEZONE = pytz.timezone('Asia/Almaty')
-GOOGLE_SHEETS_ID = "1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE"
+// Configure logging
+const logger = winston.createLogger({
+  level: 'debug',
+  formats: [
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => {
+      return `${timestamp} - ${level} - ${message}`;
+    })
+  ],
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'bot.log' })
+  ]
+});
 
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
-if ADMIN_IDS_STR:
-    ADMIN_IDS = {int(uid.strip()) for uid in ADMIN_IDS_STR.split(',')}
-else:
-    ADMIN_IDS = set()
+// Configuration
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  logger.error('BOT_TOKEN is not set');
+  process.exit(1);
+}
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+const GROUP_TIMEZONE = process.env.GROUP_TIMEZONE || 'Asia/Almaty';
+const ADMIN_USERNAMES = process.env.ADMIN_USERNAMES ? 
+  process.env.ADMIN_USERNAMES.split(',').map(u => u.trim()) : [];
 
-storage = MemoryStorage()
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=storage)
+// Initialize bot
+const bot = new Telegraf(BOT_TOKEN);
 
-def init_google_sheets():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH"), scopes=scope)
-    client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
+// Database setup
+const db = new sqlite3.Database('shifts.db');
 
-    # Создание или получение листа "Report"
-    try:
-        report_worksheet = spreadsheet.worksheet("Report")
-    except gspread.exceptions.WorksheetNotFound:
-        report_worksheet = spreadsheet.add_worksheet(title="Report", rows=100, cols=10)
-        report_worksheet.update(range_name="A1:E1", values=[['Дата', 'Имя', 'Время', 'Зона', 'Witag']])
-        set_row_height(report_worksheet, '1', 40)
-        set_column_width(report_worksheet, 'A:E', 120)
-        fmt = CellFormat(
-            backgroundColor=Color(0.9, 0.9, 0.9),
-            textFormat=TextFormat(bold=True),
-            horizontalAlignment='CENTER'
-        )
-        format_cell_range(report_worksheet, 'A1:E1', fmt)
-
-    # Создание или получение листа "Timesheet"
-    try:
-        timesheet_worksheet = spreadsheet.worksheet("Timesheet")
-    except gspread.exceptions.WorksheetNotFound:
-        timesheet_worksheet = spreadsheet.add_worksheet(title="Timesheet", rows=100, cols=40)
-        
-        headers = ["Сотрудник"] + [str(i) for i in range(1, 32)] + ["Итого"]
-        column_count = len(headers)  # 34
-        end_column_letter = chr(ord('A') + column_count - 1)  # AH
-        range_str = f"A1:{end_column_letter}1"
-        
-        timesheet_worksheet.update(range_name=range_str, values=[headers])
-        set_column_width(timesheet_worksheet, f"A:{end_column_letter}", 60)
-        fmt = CellFormat(
-            backgroundColor=Color(0.9, 0.9, 0.9),
-            textFormat=TextFormat(bold=True),
-            horizontalAlignment='CENTER'
-        )
-        format_cell_range(timesheet_worksheet, range_str, fmt)
-    
-    # Получаем "Sheet1", если нужен
-    try:
-        worksheet = spreadsheet.worksheet("Sheet1")
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title="Sheet1", rows=100, cols=10)
-
-    return worksheet, report_worksheet, timesheet_worksheet
-
-def init_db():
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            full_name TEXT,
-            photo_file_id TEXT,
-            shift_date TEXT,
-            start_time TEXT,
-            end_time TEXT,
-            actual_end_time TEXT,
-            worked_hours TEXT,
-            zone TEXT,
-            witag TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def add_shift_sqlite(user_id, full_name, photo_id, s_date, s_time, e_time, zone, witag):
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    current_time_utc5 = datetime.now(GROUP_TIMEZONE)
-    cur.execute('''
-        INSERT INTO shifts (user_id, full_name, photo_file_id, shift_date, start_time, end_time, actual_end_time, worked_hours, zone, witag, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, full_name, photo_id, s_date, s_time, e_time, None, None, zone, witag, current_time_utc5))
-    conn.commit()
-    shift_id = cur.lastrowid
-    conn.close()
-    return shift_id
-
-def update_shift_status(shift_id, status):
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("UPDATE shifts SET status = ? WHERE id = ?", (status, shift_id))
-    conn.commit()
-    affected_rows = cur.rowcount
-    conn.close()
-    return affected_rows > 0
-
-def get_active_shifts():
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("SELECT id, user_id, full_name, shift_date, start_time, end_time, zone FROM shifts WHERE status = 'active'")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_all_shifts_sqlite():
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM shifts")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_user_shifts_sqlite(user_id):
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM shifts WHERE user_id = ?", (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_today_shifts_sqlite(today_date):
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM shifts WHERE shift_date = ?", (today_date,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_user_shifts_for_date_sqlite(user_id, shift_date):
-    conn = sqlite3.connect('shifts.db')
-    cur = conn.cursor()
-    cur.execute("SELECT start_time, end_time FROM shifts WHERE user_id = ? AND shift_date = ?", (user_id, shift_date))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def is_valid_time(time_str, fmt='%H:%M'):
-    try:
-        datetime.strptime(time_str, fmt).time()
-        return True
-    except ValueError:
-        return False
-
-def calculate_worked_hours(start_time_str, end_time_str):
-    start = datetime.strptime(start_time_str, '%H:%M')
-    end = datetime.strptime(end_time_str, '%H:%M')
-    if end < start:
-        end = end.replace(day=end.day + 1)
-    duration = end - start
-    hours, remainder = divmod(int(duration.total_seconds()), 3600)
-    minutes, _ = divmod(remainder, 60)
-    return f"{hours}h {minutes}m" if hours or minutes else "0h 0m"
-
-def get_admin_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📊 Отчет по сменам", callback_data="admin_report"),
-        InlineKeyboardButton("📋 Активные смены", callback_data="active_shifts"),
-        InlineKeyboardButton("📝 Табель учета", callback_data="timesheet"),
-        InlineKeyboardButton("🛑 Завершить смену", callback_data="end_shift_menu"),
-        InlineKeyboardButton("❌ Отменить смену", callback_data="cancel_shift_menu")
+// Initialize database
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS shifts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL,
+      full_name TEXT NOT NULL,
+      photo_file_id TEXT,
+      shift_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      actual_end_time TEXT,
+      worked_hours TEXT,
+      zone TEXT NOT NULL,
+      witag TEXT,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    return keyboard
+  `);
+});
 
-def get_shift_actions_keyboard(shift_id):
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_action_{shift_id}"),
-        InlineKeyboardButton("❌ Отменить", callback_data="cancel_action")
-    )
-    return keyboard
+// Database functions
+const dbGet = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+};
 
-@dp.message_handler(commands=['admin'])
-async def admin_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.reply("🚫 Доступ запрещен")
-        return
-    await message.reply("👨‍💻 Панель администратора", reply_markup=get_admin_keyboard())
+const dbAll = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+};
 
-@dp.callback_query_handler(lambda c: c.data == 'admin_report')
-async def process_admin_report(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    shifts = get_all_shifts_sqlite()
-    if not shifts:
-        await bot.send_message(callback_query.from_user.id, "📄 Смены не найдены.")
-        return
-    
-    report_text = ["📊 Отчет по всем сменам"]
-    for shift in shifts:
-        report_text.append(
-            f"\n📅 {shift[4]} | 👤 {shift[2]} | ⏰ {shift[5]}-{shift[6]} | "
-            f"📍 {shift[9]} | 🔖 {shift[10]} | {'✅ Активна' if len(shift) > 11 and shift[11] == 'active' else '❌ Завершена'}"
-        )
-    
-    await bot.send_message(callback_query.from_user.id, "\n".join(report_text))
+const dbRun = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+};
 
-@dp.callback_query_handler(lambda c: c.data == 'active_shifts')
-async def process_active_shifts(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    active_shifts = get_active_shifts()
-    if not active_shifts:
-        await bot.send_message(callback_query.from_user.id, "📄 Активных смен нет.")
-        return
-    
-    report_text = ["📋 Активные смены"]
-    for shift in active_shifts:
-        report_text.append(
-            f"\n🆔 {shift[0]} | 👤 {shift[2]} | 📅 {shift[3]} | ⏰ {shift[4]}-{shift[5]} | "
-            f"📍 {shift[6]}"
-        )
-    
-    await bot.send_message(callback_query.from_user.id, "\n".join(report_text))
+// Helper functions
+const isAdmin = (username) => ADMIN_USERNAMES.includes(username);
+const getCurrentDate = () => format(utcToZonedTime(new Date(), GROUP_TIMEZONE), 'dd.MM.yy');
+const isValidTime = (time) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(time);
 
-@dp.callback_query_handler(lambda c: c.data in ['end_shift_menu', 'cancel_shift_menu'])
-async def process_shift_action_menu(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    action = "end" if callback_query.data == 'end_shift_menu' else "cancel"
-    active_shifts = get_active_shifts()
-    
-    if not active_shifts:
-        await bot.send_message(callback_query.from_user.id, "📄 Активных смен нет.")
-        return
-    
-    keyboard = InlineKeyboardMarkup()
-    for shift in active_shifts:
-        keyboard.add(InlineKeyboardButton(
-            f"🆔 {shift[0]} | 👤 {shift[2]} | ⏰ {shift[4]}-{shift[5]}",
-            callback_data=f"{action}_shift_{shift[0]}"
-        ))
-    
-    action_text = "завершить" if action == "end" else "отменить"
-    await bot.send_message(
-        callback_query.from_user.id,
-        f"Выберите смену для {action_text}:",
-        reply_markup=keyboard
-    )
+const calculateWorkedHours = (start, end) => {
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  
+  let minutes = (eh * 60 + em) - (sh * 60 + sm);
+  if (minutes < 0) minutes += 24 * 60;
+  
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+};
 
-@dp.callback_query_handler(lambda c: c.data.startswith(('end_shift_', 'cancel_shift_')))
-async def process_shift_action(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    shift_id = int(callback_query.data.split('_')[-1])
-    action = callback_query.data.split('_')[0]
-    
-    await bot.send_message(
-        callback_query.from_user.id,
-        f"Вы уверены, что хотите {'завершить' if action == 'end' else 'отменить'} смену ID {shift_id}?",
-        reply_markup=get_shift_actions_keyboard(shift_id)
-    )
+// Keyboards
+const adminKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('📊 Отчет', 'admin_report')],
+  [Markup.button.callback('📋 Активные', 'active_shifts')],
+  [Markup.button.callback('📝 Табель', 'timesheet')],
+  [
+    Markup.button.callback('🛑 Завершить', 'end_shift_menu'),
+    Markup.button.callback('❌ Отменить', 'cancel_shift_menu')
+  ]
+]);
 
-@dp.callback_query_handler(lambda c: c.data.startswith('confirm_action_'))
-async def process_confirm_action(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    shift_id = int(callback_query.data.split('_')[-1])
-    status = 'completed' if 'end' in callback_query.data else 'canceled'
-    success = update_shift_status(shift_id, status)
-    
-    if success:
-        await bot.send_message(callback_query.from_user.id, f"✅ Смена ID {shift_id} успешно {'завершена' if status == 'completed' else 'отменена'}")
-    else:
-        await bot.send_message(callback_query.from_user.id, f"❌ Не удалось обновить смену ID {shift_id}")
+const shiftActionsKeyboard = (shiftId) => Markup.inlineKeyboard([
+  [
+    Markup.button.callback('✅ Подтвердить', `confirm_action_${shiftId}`),
+    Markup.button.callback('❌ Отменить', 'cancel_action')
+  ]
+]);
 
-@dp.callback_query_handler(lambda c: c.data == 'timesheet')
-async def process_timesheet(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await bot.answer_callback_query(callback_query.id, "🚫 Доступ запрещен")
-        return
-    
-    timesheet_data = [
-        ["Берикулы Айсар СС", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "FALSE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "", "", "210000", "TRUE", "TRUE", "TRUE", "TRUE", "FALSE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "", "", "135000"],
-        ["Алимжан Дархан", "8", "8", "16", "7", "16", "15", "", "8", "8", "8", "8", "8", "16", "8", "", "", "", "167500", "8", "8", "8", "8", "", "8", "8", "8", "7", "", "", "", "", "", "", "", "", "", "78750"],
-    ]
-    
-    message_text = "📊 Табель учета рабочего времени\n\n"
-    for row in timesheet_data:
-        message_text += " | ".join(str(item) for item in row) + "\n"
-    
-    await bot.send_message(callback_query.from_user.id, f"<pre>{message_text}</pre>", parse_mode=ParseMode.HTML)
+// Command handlers
+bot.command('admin', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.reply('🚫 Доступ запрещен');
+  }
+  await ctx.reply('👨‍💻 Админ панель', adminKeyboard);
+});
 
-@dp.message_handler(commands=['start', 'help'])
-async def send_welcome(message: types.Message):
-    await message.reply(
-        "👋 Я бот для учета смен.\n"
-        "Отправьте фото с подписью в формате:\n\n"
-        "```\n"
-        "Ербакыт Муратбек\n"
-        "07:00 15:00\n"
-        "Зона 12\n"
-        "W witag 5\n"
-        "```\n\n"
-        "Команды:\n"
-        "- /myshifts - Ваши смены\n"
-        "- /today - Смены сегодня\n"
-        "- /admin - Панель админа",
-        parse_mode=ParseMode.MARKDOWN
-    )
+bot.command(['start', 'help'], async (ctx) => {
+  await ctx.replyWithMarkdown(`
+👋 Бот для учета смен. Отправьте фото с подписью в формате:
 
-@dp.message_handler(content_types=['photo'])
-async def handle_photo_with_caption(message: types.Message):
-    user_id = message.from_user.id
-    user_full_name = message.from_user.full_name
+\`\`\`
+Имя Фамилия
+07:00 15:00
+Зона 1
+W witag 1
+\`\`\`
 
-    if not message.caption:
-        await message.reply("❌ Отправьте фото с подписью.")
-        return
+*Команды:*
+/myshifts - Ваши смены
+/today - Смены сегодня
+/admin - Админ панель
+  `);
+});
 
-    shift_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
+bot.command('myshifts', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username) return ctx.reply('❌ Установите username в Telegram');
 
-    pattern = re.compile(
-        r'^(?P<name>[\w\sА-Яа-я]+)\s+'
-        r'(?P<start_time>\d{2}:\d{2})\s(?P<end_time>\d{2}:\d{2})\s+'
-        r'(?P<zone>Зона\s+\d+)\s*'
-        r'(?P<witag_val>W\s+witag\s+\d+)?$',
-        re.MULTILINE | re.IGNORECASE
-    )
-    
-    match = pattern.match(message.caption.strip())
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE username = ? ORDER BY shift_date DESC, start_time", 
+      [username]
+    );
 
-    if not match:
-        await message.reply(
-            "❌ Неверный формат подписи.\n"
-            "Пример:\n"
-            "```\n"
-            "Ербакыт Муратбек\n"
-            "07:00 15:00\n"
-            "Зона 12\n"
-            "```",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+    if (!shifts.length) return ctx.reply('📄 У вас нет смен');
 
-    full_name = match.group('name').strip()
-    start_time_str = match.group('start_time')
-    end_time_str = match.group('end_time')
-    zone = match.group('zone').strip()
-    witag = match.group('witag_val').strip() if match.group('witag_val') else "Нет"
+    let message = `📋 Ваши смены (@${username})\n`;
+    let currentDate = '';
 
-    if not is_valid_time(start_time_str) or not is_valid_time(end_time_str):
-        await message.reply("❌ Неверный формат времени (ЧЧ:ММ).")
-        return
+    for (const shift of shifts) {
+      if (shift.shift_date !== currentDate) {
+        currentDate = shift.shift_date;
+        message += `\n📅 *${currentDate}*\n`;
+      }
 
-    try:
-        new_start_time = datetime.strptime(start_time_str, '%H:%M').time()
-        new_end_time = datetime.strptime(end_time_str, '%H:%M').time()
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `${status} ${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+      message += '\n';
+    }
 
-        if new_start_time >= new_end_time:
-            await message.reply("❌ Время начала должно быть раньше окончания.")
-            return
-    except Exception:
-        await message.reply("❌ Ошибка разбора времени.")
-        return
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('myshifts error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
 
-    existing_shifts = get_user_shifts_for_date_sqlite(user_id, shift_date)
-    for existing_start_str, existing_end_str in existing_shifts:
-        existing_start_time = datetime.strptime(existing_start_str, '%H:%M').time()
-        existing_end_time = datetime.strptime(existing_end_str, '%H:%M').time()
+bot.command('today', async (ctx) => {
+  try {
+    const today = getCurrentDate();
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE shift_date = ? ORDER BY start_time",
+      [today]
+    );
 
-        if (new_start_time < existing_end_time) and (new_end_time > existing_start_time):
-            await message.reply(
-                f"❌ Пересечение с существующей сменой "
-                f"({existing_start_str}-{existing_end_str})"
-            )
-            return
+    if (!shifts.length) return ctx.reply(`📅 На ${today} смен нет`);
 
-    try:
-        shift_id = add_shift_sqlite(user_id, full_name, message.photo[-1].file_id, shift_date, start_time_str, end_time_str, zone, witag)
-        await message.reply(
-            f"✅ **{full_name}** записан на смену.\n"
-            f"📅 Дата: `{shift_date}`\n"
-            f"⏰ Время: `{start_time_str}-{end_time_str}`\n"
-            f"📍 Зона: `{zone}`\n"
-            f"🔖 Witag: `{witag}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при добавлении смены: {e}")
-        await message.reply("❗️ Ошибка. Попробуйте позже.")
+    let message = `📅 Смены на ${today}\n`;
+    for (const shift of shifts) {
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `\n${status} @${shift.username} (${shift.full_name})\n`;
+      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+    }
 
-@dp.message_handler(commands=['myshifts'])
-async def get_my_shifts(message: types.Message):
-    user_id = message.from_user.id
-    shifts = get_user_shifts_sqlite(user_id)
-    
-    if not shifts:
-        await message.reply("📄 У вас нет смен.", parse_mode=ParseMode.MARKDOWN)
-        return
+    await ctx.reply(message);
+  } catch (err) {
+    logger.error('today error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
 
-    shifts_by_date = defaultdict(list)
-    for shift in shifts:
-        shift_id, _, full_name, shift_date, start_time, end_time, _, _, _, zone, witag, status, _ = shift
-        shift_type = (
-            "☀️ Утро" if start_time == "07:00" and end_time == "15:00" else
-            "🌙 Вечер" if start_time == "15:00" and end_time == "23:00" else
-            "🗓️ Полный день" if start_time == "07:00" and end_time == "23:00" else
-            "⏰ Другое"
-        )
-        shifts_by_date[shift_date].append({
-            'shift_id': shift_id,
-            'full_name': full_name,
-            'start_time': start_time,
-            'end_time': end_time,
-            'zone': zone,
-            'witag': witag,
-            'status': status,
-            'shift_type': shift_type
-        })
+// Photo handler
+bot.on('photo', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username) return ctx.reply('❌ Установите username в Telegram');
 
-    report_text = [f"**📋 Ваши смены, {message.from_user.full_name}**"]
-    
-    for shift_date in sorted(shifts_by_date.keys(), reverse=True):
-        report_text.append(f"\n**📅 {shift_date}**")
-        report_text.append("```")
-        report_text.append("| ID | Тип смены       | Время        | Зона      | Статус   |")
-        report_text.append("|----|-----------------|--------------|-----------|----------|")
-        
-        for shift in shifts_by_date[shift_date]:
-            status = "✅ Активна" if shift['status'] == 'active' else "❌ Завершена" if shift['status'] == 'completed' else "🚫 Отменена"
-            report_text.append(
-                f"| {shift['shift_id']:<2} | {shift['shift_type']:<15} | {shift['start_time']}-{shift['end_time']} | {shift['zone']:<9} | {status:<8} |"
-            )
-        
-        report_text.append("```")
+  if (!ctx.message.caption) {
+    return ctx.reply('❌ Отправьте фото с подписью');
+  }
 
-    await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
+  const match = ctx.message.caption.match(
+    /^([^\n]+)\n(\d{2}:\d{2})\s(\d{2}:\d{2})\n(Зона\s+\d+)(?:\n(W\s+witag\s+\d+))?/i
+  );
 
-@dp.message_handler(commands=['today'])
-async def get_today_shifts(message: types.Message):
-    today_date = datetime.now(GROUP_TIMEZONE).strftime('%d.%m.%y')
-    shifts = get_today_shifts_sqlite(today_date)
-    
-    if not shifts:
-        await message.reply(f"📄 На {today_date} смен нет.", parse_mode=ParseMode.MARKDOWN)
-        return
+  if (!match) {
+    return ctx.replyWithMarkdown(`
+❌ Неверный формат. Пример:
+\`\`\`
+Имя Фамилия
+07:00 15:00
+Зона 1
+W witag 1
+\`\`\`
+    `);
+  }
 
-    report_text = [f"**📅 Смены за {today_date}**"]
-    report_text.append("```")
-    report_text.append("| Тип смены       | Имя              | Время        | Зона      | Статус   |")
-    report_text.append("|-----------------|------------------|--------------|-----------|----------|")
+  const fullName = match[1].trim();
+  const startTime = match[2];
+  const endTime = match[3];
+  const zone = match[4].trim();
+  const witag = match[5] ? match[5].trim() : 'Нет';
 
-    for shift in shifts:
-        _, _, full_name, _, start_time, end_time, _, _, _, zone, _, status, _ = shift
-        shift_type = (
-            "☀️ Утро" if start_time == "07:00" and end_time == "15:00" else
-            "🌙 Вечер" if start_time == "15:00" and end_time == "23:00" else
-            "🗓️ Полный день" if start_time == "07:00" and end_time == "23:00" else
-            "⏰ Другое"
-        )
-        status = "✅ Активна" if status == 'active' else "❌ Завершена" if status == 'completed' else "🚫 Отменена"
-        report_text.append(
-            f"| {shift_type:<15} | {full_name:<16} | {start_time}-{end_time} | {zone:<9} | {status:<8} |"
-        )
+  if (!isValidTime(startTime) || !isValidTime(endTime)) {
+    return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
+  }
 
-    report_text.append("```")
-    await message.reply("\n".join(report_text), parse_mode=ParseMode.MARKDOWN)
+  try {
+    const shiftDate = getCurrentDate();
+    const existingShifts = await dbAll(
+      "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ?",
+      [username, shiftDate]
+    );
 
-if __name__ == '__main__':
-    init_db()
-    try:
-        worksheet, report_worksheet, timesheet_worksheet = init_google_sheets()
-    except Exception as e:
-        logging.error(f"Google Sheets init failed: {e}")
-        worksheet, report_worksheet, timesheet_worksheet = None, None, None
-    
-    logging.info("Бот запущен...")
-    executor.start_polling(dp, skip_updates=True)
+    for (const shift of existingShifts) {
+      if ((startTime < shift.end_time) && (endTime > shift.start_time)) {
+        return ctx.reply(
+          `❌ Пересечение с существующей сменой ${shift.start_time}-${shift.end_time}`
+        );
+      }
+    }
+
+    const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+    await dbRun(
+      `INSERT INTO shifts (username, full_name, photo_file_id, shift_date, 
+       start_time, end_time, zone, witag)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
+    );
+
+    await ctx.replyWithMarkdown(`
+✅ *${fullName}* записан на смену
+📅 *Дата:* \`${shiftDate}\`
+⏰ *Время:* \`${startTime}-${endTime}\`
+📍 *Зона:* \`${zone}\`
+🔖 *Witag:* \`${witag}\`
+    `);
+  } catch (err) {
+    logger.error('Shift registration error:', err);
+    await ctx.reply('❌ Ошибка регистрации смены');
+  }
+});
+
+// Admin handlers
+bot.action('admin_report', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts ORDER BY shift_date DESC, start_time"
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Смены не найдены');
+
+    let message = '📊 *Отчет по сменам*\n';
+    let currentDate = '';
+
+    for (const shift of shifts) {
+      if (shift.shift_date !== currentDate) {
+        currentDate = shift.shift_date;
+        message += `\n📅 *${currentDate}*\n`;
+      }
+
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `${status} @${shift.username} (${shift.full_name})\n`;
+      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+      message += ` [ID:${shift.id}]\n`;
+    }
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('admin_report error:', err);
+    await ctx.reply('❌ Ошибка отчета');
+  }
+});
+
+bot.action('active_shifts', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE status = 'active' ORDER BY shift_date, start_time"
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Активных смен нет');
+
+    let message = '📋 *Активные смены*\n';
+    for (const shift of shifts) {
+      message += `\n🆔 *${shift.id}* @${shift.username} (${shift.full_name})\n`;
+      message += `📅 ${shift.shift_date} ⏰ ${shift.start_time}-${shift.end_time}\n`;
+      message += `📍 ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` 🔖 ${shift.witag}`;
+    }
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('active_shifts error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
+
+bot.action('timesheet', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    // В реальной версии здесь должна быть загрузка из Google Sheets
+    const timesheetData = [
+      ["Берикулы Айсар СС", "8", "8", "8", "8", "8", "0", "8", "8", "8", "8", "8", "8", "8", "8", "8", "", "", "210000"],
+      ["Алимжан Дархан", "8", "8", "16", "7", "16", "15", "", "8", "8", "8", "8", "8", "16", "8", "", "", "", "167500"]
+    ];
+
+    let message = '📝 *Табель учета*\n```\n';
+    for (const row of timesheetData) {
+      message += row.join('\t') + '\n';
+    }
+    message += '```';
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('timesheet error:', err);
+    await ctx.reply('❌ Ошибка табеля');
+  }
+});
+
+bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'cancel';
+
+  try {
+    const shifts = await dbAll(
+      "SELECT id, username, full_name, start_time, end_time FROM shifts WHERE status = 'active'"
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Активных смен нет');
+
+    const buttons = shifts.map(shift => [
+      Markup.button.callback(
+        `${shift.id} @${shift.username} ${shift.start_time}-${shift.end_time}`,
+        `${action}_shift_${shift.id}`
+      )
+    ]);
+
+    await ctx.reply(
+      `Выберите смену для ${action === 'end' ? 'завершения' : 'отмены'}:`,
+      Markup.inlineKeyboard(buttons)
+    );
+  } catch (err) {
+    logger.error('shift menu error:', err);
+    await ctx.reply('❌ Ошибка выбора смены');
+  }
+});
+
+bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const shiftId = parseInt(ctx.match[2]);
+  const action = ctx.match[1].startsWith('end') ? 'end' : 'cancel';
+
+  try {
+    const shift = await dbGet(
+      "SELECT username, full_name, start_time, end_time FROM shifts WHERE id = ?",
+      [shiftId]
+    );
+
+    if (!shift) return ctx.reply('❌ Смена не найдена');
+
+    await ctx.replyWithMarkdown(
+      `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\n` +
+      `🆔 *${shiftId}* @${shift.username} (${shift.full_name})\n` +
+      `⏰ ${shift.start_time}-${shift.end_time}`,
+      shiftActionsKeyboard(shiftId)
+    );
+  } catch (err) {
+    logger.error('shift action error:', err);
+    await ctx.reply('❌ Ошибка подтверждения');
+  }
+});
+
+bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const shiftId = parseInt(ctx.match[1]);
+  const action = ctx.callbackQuery.data.includes('end') ? 'completed' : 'canceled';
+
+  try {
+    const result = await dbRun(
+      "UPDATE shifts SET status = ? WHERE id = ?",
+      [action, shiftId]
+    );
+
+    if (result.changes > 0) {
+      await ctx.reply(`✅ Смена ${shiftId} ${action === 'completed' ? 'завершена' : 'отменена'}`);
+    } else {
+      await ctx.reply('❌ Смена не найдена');
+    }
+  } catch (err) {
+    logger.error('confirm action error:', err);
+    await ctx.reply('❌ Ошибка обновления');
+  }
+});
+
+// Error handling
+bot.catch((err, ctx) => {
+  logger.error(`Error for ${ctx.updateType}:`, err);
+  ctx.reply('❌ Произошла ошибка');
+});
+
+// Start bot
+bot.launch()
+  .then(() => logger.info('Bot started'))
+  .catch(err => {
+    logger.error('Bot start failed:', err);
+    process.exit(1);
+  });
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
