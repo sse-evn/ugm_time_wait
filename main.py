@@ -8,40 +8,38 @@ const winston = require('winston');
 // Configure logging
 const logger = winston.createLogger({
   level: 'debug',
-  formats: [
+  format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.printf(({ timestamp, level, message }) => {
       return `${timestamp} - ${level} - ${message}`;
     })
-  ],
+  ),
   transports: [
     new winston.transports.Console(),
     new winston.transports.File({ filename: 'bot.log' })
   ]
 });
 
-// Configuration
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  logger.error('BOT_TOKEN is not set');
-  process.exit(1);
-}
-
-const GROUP_TIMEZONE = process.env.GROUP_TIMEZONE || 'Asia/Almaty';
-const ADMIN_USERNAMES = process.env.ADMIN_USERNAMES ? 
-  process.env.ADMIN_USERNAMES.split(',').map(u => u.trim()) : [];
-
-// Initialize bot
-const bot = new Telegraf(BOT_TOKEN);
-
 // Database setup
 const db = new sqlite3.Database('shifts.db');
 
 // Initialize database
 db.serialize(() => {
+  // Таблица для хранения настроек групп
+  db.run(`
+    CREATE TABLE IF NOT EXISTS groups (
+      group_id TEXT PRIMARY KEY,
+      bot_token TEXT NOT NULL,
+      admin_usernames TEXT,
+      group_timezone TEXT NOT NULL
+    )
+  `);
+
+  // Таблица для смен, с добавлением group_id
   db.run(`
     CREATE TABLE IF NOT EXISTS shifts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_id TEXT NOT NULL,
       username TEXT NOT NULL,
       full_name TEXT NOT NULL,
       photo_file_id TEXT,
@@ -53,7 +51,8 @@ db.serialize(() => {
       zone TEXT NOT NULL,
       witag TEXT,
       status TEXT DEFAULT 'active',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (group_id) REFERENCES groups(group_id)
     )
   `);
 });
@@ -87,8 +86,25 @@ const dbRun = (query, params = []) => {
 };
 
 // Helper functions
-const isAdmin = (username) => ADMIN_USERNAMES.includes(username);
-const getCurrentDate = () => format(utcToZonedTime(new Date(), GROUP_TIMEZONE), 'dd.MM.yy');
+const getGroupConfig = async (groupId) => {
+  try {
+    const config = await dbGet(
+      'SELECT * FROM groups WHERE group_id = ?',
+      [groupId]
+    );
+    return config || null;
+  } catch (err) {
+    logger.error('Error fetching group config:', err);
+    return null;
+  }
+};
+
+const isAdmin = (username, adminUsernames) => {
+  return adminUsernames ? adminUsernames.split(',').map(u => u.trim()).includes(username) : false;
+};
+
+const getCurrentDate = (timezone) => format(utcToZonedTime(new Date(), timezone), 'dd.MM.yy');
+
 const isValidTime = (time) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(time);
 
 const calculateWorkedHours = (start, end) => {
@@ -119,10 +135,43 @@ const shiftActionsKeyboard = (shiftId) => Markup.inlineKeyboard([
   ]
 ]);
 
+// Middleware to load group config
+const loadGroupConfig = async (ctx, next) => {
+  const groupId = ctx.chat?.id?.toString();
+  if (!groupId || ctx.chat.type === 'private') {
+    return ctx.reply('❌ Этот бот работает только в группах');
+  }
+
+  const config = await getGroupConfig(groupId);
+  if (!config) {
+    return ctx.reply('❌ Группа не настроена. Обратитесь к администратору.');
+  }
+
+  ctx.groupConfig = {
+    groupId,
+    botToken: config.bot_token,
+    adminUsernames: config.admin_usernames,
+    timezone: config.group_timezone
+  };
+
+  return next();
+};
+
+// Initialize bot (using a default token for initialization)
+const DEFAULT_BOT_TOKEN = process.env.BOT_TOKEN;
+if (!DEFAULT_BOT_TOKEN) {
+  logger.error('DEFAULT_BOT_TOKEN is not set');
+  process.exit(1);
+}
+const bot = new Telegraf(DEFAULT_BOT_TOKEN);
+
+// Apply middleware to all handlers
+bot.use(loadGroupConfig);
+
 // Command handlers
 bot.command('admin', async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.reply('🚫 Доступ запрещен');
   }
   await ctx.reply('👨‍💻 Админ панель', adminKeyboard);
@@ -148,12 +197,14 @@ W witag 1
 
 bot.command('myshifts', async (ctx) => {
   const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
   if (!username) return ctx.reply('❌ Установите username в Telegram');
 
   try {
     const shifts = await dbAll(
-      "SELECT * FROM shifts WHERE username = ? ORDER BY shift_date DESC, start_time", 
-      [username]
+      "SELECT * FROM shifts WHERE username = ? AND group_id = ? ORDER BY shift_date DESC, start_time", 
+      [username, groupId]
     );
 
     if (!shifts.length) return ctx.reply('📄 У вас нет смен');
@@ -184,10 +235,11 @@ bot.command('myshifts', async (ctx) => {
 
 bot.command('today', async (ctx) => {
   try {
-    const today = getCurrentDate();
+    const today = getCurrentDate(ctx.groupConfig.timezone);
+    const groupId = ctx.groupConfig.groupId;
     const shifts = await dbAll(
-      "SELECT * FROM shifts WHERE shift_date = ? ORDER BY start_time",
-      [today]
+      "SELECT * FROM shifts WHERE shift_date = ? AND group_id = ? ORDER BY start_time",
+      [today, groupId]
     );
 
     if (!shifts.length) return ctx.reply(`📅 На ${today} смен нет`);
@@ -212,6 +264,9 @@ bot.command('today', async (ctx) => {
 // Photo handler
 bot.on('photo', async (ctx) => {
   const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+  const timezone = ctx.groupConfig.timezone;
+
   if (!username) return ctx.reply('❌ Установите username в Telegram');
 
   if (!ctx.message.caption) {
@@ -245,10 +300,10 @@ W witag 1
   }
 
   try {
-    const shiftDate = getCurrentDate();
+    const shiftDate = getCurrentDate(timezone);
     const existingShifts = await dbAll(
-      "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ?",
-      [username, shiftDate]
+      "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ? AND group_id = ?",
+      [username, shiftDate, groupId]
     );
 
     for (const shift of existingShifts) {
@@ -261,10 +316,10 @@ W witag 1
 
     const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
     await dbRun(
-      `INSERT INTO shifts (username, full_name, photo_file_id, shift_date, 
+      `INSERT INTO shifts (group_id, username, full_name, photo_file_id, shift_date, 
        start_time, end_time, zone, witag)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
     );
 
     await ctx.replyWithMarkdown(`
@@ -283,13 +338,16 @@ W witag 1
 // Admin handlers
 bot.action('admin_report', async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
   try {
     const shifts = await dbAll(
-      "SELECT * FROM shifts ORDER BY shift_date DESC, start_time"
+      "SELECT * FROM shifts WHERE group_id = ? ORDER BY shift_date DESC, start_time",
+      [groupId]
     );
 
     if (!shifts.length) return ctx.reply('📄 Смены не найдены');
@@ -321,13 +379,16 @@ bot.action('admin_report', async (ctx) => {
 
 bot.action('active_shifts', async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
   try {
     const shifts = await dbAll(
-      "SELECT * FROM shifts WHERE status = 'active' ORDER BY shift_date, start_time"
+      "SELECT * FROM shifts WHERE status = 'active' AND group_id = ? ORDER BY shift_date, start_time",
+      [groupId]
     );
 
     if (!shifts.length) return ctx.reply('📄 Активных смен нет');
@@ -349,7 +410,7 @@ bot.action('active_shifts', async (ctx) => {
 
 bot.action('timesheet', async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
@@ -375,7 +436,9 @@ bot.action('timesheet', async (ctx) => {
 
 bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
@@ -383,7 +446,8 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
 
   try {
     const shifts = await dbAll(
-      "SELECT id, username, full_name, start_time, end_time FROM shifts WHERE status = 'active'"
+      "SELECT id, username, full_name, start_time, end_time FROM shifts WHERE status = 'active' AND group_id = ?",
+      [groupId]
     );
 
     if (!shifts.length) return ctx.reply('📄 Активных смен нет');
@@ -407,7 +471,9 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
 
 bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
@@ -416,8 +482,8 @@ bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
 
   try {
     const shift = await dbGet(
-      "SELECT username, full_name, start_time, end_time FROM shifts WHERE id = ?",
-      [shiftId]
+      "SELECT username, full_name, start_time, end_time FROM shifts WHERE id = ? AND group_id = ?",
+      [shiftId, groupId]
     );
 
     if (!shift) return ctx.reply('❌ Смена не найдена');
@@ -436,7 +502,9 @@ bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
 
 bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
   const username = ctx.from.username;
-  if (!username || !isAdmin(username)) {
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
@@ -445,8 +513,8 @@ bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
 
   try {
     const result = await dbRun(
-      "UPDATE shifts SET status = ? WHERE id = ?",
-      [action, shiftId]
+      "UPDATE shifts SET status = ? WHERE id = ? AND group_id = ?",
+      [action, shiftId, groupId]
     );
 
     if (result.changes > 0) {
