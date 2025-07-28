@@ -2,7 +2,6 @@ require('dotenv').config();
 const sqlite3 = require('sqlite3').verbose();
 const { Telegraf, Markup } = require('telegraf');
 const { format } = require('date-fns');
-const { utcToZonedTime } = require('date-fns-tz');
 const winston = require('winston');
 
 // Configure logging
@@ -38,6 +37,7 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
     adminUsernames: adminUsernames.split(',').map(u => u.trim()),
     timezone: groupTimezone
   });
+  console.log('Loaded group config:', { groupId, adminUsernames, timezone: groupTimezone });
 
   groupIndex++;
 }
@@ -59,7 +59,7 @@ db.serialize(() => {
       username TEXT NOT NULL,
       full_name TEXT NOT NULL,
       photo_file_id TEXT,
-      shift_date TEXT NOT NULL,
+      shift_date TEXT NOT NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
       actual_end_time TEXT,
@@ -113,7 +113,21 @@ const isAdmin = (username, adminUsernames) => {
   return adminUsernames.includes(username);
 };
 
-const getCurrentDate = (timezone) => format(utcToZonedTime(new Date(), timezone), 'dd.MM.yy');
+const getCurrentDate = (timezone) => {
+  console.log('Timezone:', timezone);
+  if (!timezone) throw new Error('Timezone is undefined');
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: '2-digit',
+      timeZone: timezone,
+    }).format(new Date()).split('/').join('.');
+  } catch (err) {
+    console.error('Error in getCurrentDate:', err);
+    throw err;
+  }
+};
 
 const isValidTime = (time) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(time);
 
