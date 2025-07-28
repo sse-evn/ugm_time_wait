@@ -25,18 +25,16 @@ const groupConfigs = [];
 let groupIndex = 1;
 while (process.env[`GROUP${groupIndex}_ID`]) {
   const groupId = process.env[`GROUP${groupIndex}_ID`];
-  const botToken = process.env[`GROUP${groupIndex}_TOKEN`];
   const adminUsernames = process.env[`GROUP${groupIndex}_ADMINS`];
   const groupTimezone = process.env[`GROUP${groupIndex}_TIMEZONE`];
 
-  if (!botToken || !adminUsernames || !groupTimezone) {
+  if (!adminUsernames || !groupTimezone) {
     logger.error(`Incomplete configuration for GROUP${groupIndex}`);
     process.exit(1);
   }
 
   groupConfigs.push({
     groupId,
-    botToken,
     adminUsernames: adminUsernames.split(',').map(u => u.trim()),
     timezone: groupTimezone
   });
@@ -104,7 +102,11 @@ const dbRun = (query, params = []) => {
 
 // Helper functions
 const getGroupConfig = (groupId) => {
-  return groupConfigs.find(config => config.groupId === groupId) || null;
+  const config = groupConfigs.find(config => config.groupId === groupId);
+  return config ? {
+    ...config,
+    botToken: process.env.BOT_TOKEN
+  } : null;
 };
 
 const isAdmin = (username, adminUsernames) => {
@@ -143,38 +145,36 @@ const shiftActionsKeyboard = (shiftId) => Markup.inlineKeyboard([
   ]
 ]);
 
-// Initialize bot pool
-const botPool = {};
-groupConfigs.forEach(config => {
-  const bot = new Telegraf(config.botToken);
+// Initialize bot
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-  // Middleware to load group config
-  bot.use(async (ctx, next) => {
-    const groupId = ctx.chat?.id?.toString();
-    if (!groupId || ctx.chat.type === 'private') {
-      return ctx.reply('❌ Этот бот работает только в группах');
-    }
+// Middleware to load group config
+bot.use(async (ctx, next) => {
+  const groupId = ctx.chat?.id?.toString();
+  if (!groupId || ctx.chat.type === 'private') {
+    return ctx.reply('❌ Этот бот работает только в группах');
+  }
 
-    const groupConfig = getGroupConfig(groupId);
-    if (!groupConfig) {
-      return ctx.reply('❌ Эта группа не настроена');
-    }
+  const groupConfig = getGroupConfig(groupId);
+  if (!groupConfig) {
+    return ctx.reply('❌ Эта группа не настроена');
+  }
 
-    ctx.groupConfig = groupConfig;
-    return next();
-  });
+  ctx.groupConfig = groupConfig;
+  return next();
+});
 
-  // Command handlers
-  bot.command('admin', async (ctx) => {
-    const username = ctx.from.username;
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.reply('🚫 Доступ запрещен');
-    }
-    await ctx.reply('👨‍💻 Админ панель', adminKeyboard);
-  });
+// Command handlers
+bot.command('admin', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.reply('🚫 Доступ запрещен');
+  }
+  await ctx.reply('👨‍💻 Админ панель', adminKeyboard);
+});
 
-  bot.command(['start', 'help'], async (ctx) => {
-    await ctx.replyWithMarkdown(`
+bot.command(['start', 'help'], async (ctx) => {
+  await ctx.replyWithMarkdown(`
 👋 Бот для учета смен. Отправьте фото с подписью в формате:
 
 \`\`\`
@@ -188,93 +188,93 @@ W witag 1
 /myshifts - Ваши смены
 /today - Смены сегодня
 /admin - Админ панель
-    `);
-  });
+  `);
+});
 
-  bot.command('myshifts', async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
+bot.command('myshifts', async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
 
-    if (!username) return ctx.reply('❌ Установите username в Telegram');
+  if (!username) return ctx.reply('❌ Установите username в Telegram');
 
-    try {
-      const shifts = await dbAll(
-        "SELECT * FROM shifts WHERE username = ? AND group_id = ? ORDER BY shift_date DESC, start_time", 
-        [username, groupId]
-      );
-
-      if (!shifts.length) return ctx.reply('📄 У вас нет смен');
-
-      let message = `📋 Ваши смены (@${username})\n`;
-      let currentDate = '';
-
-      for (const shift of shifts) {
-        if (shift.shift_date !== currentDate) {
-          currentDate = shift.shift_date;
-          message += `\n📅 *${currentDate}*\n`;
-        }
-
-        const status = shift.status === 'active' ? '✅' : 
-                      shift.status === 'completed' ? '⏹️' : '❌';
-        
-        message += `${status} ${shift.start_time}-${shift.end_time} ${shift.zone}`;
-        if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
-        message += '\n';
-      }
-
-      await ctx.replyWithMarkdown(message);
-    } catch (err) {
-      logger.error('myshifts error:', err);
-      await ctx.reply('❌ Ошибка получения смен');
-    }
-  });
-
-  bot.command('today', async (ctx) => {
-    try {
-      const today = getCurrentDate(ctx.groupConfig.timezone);
-      const groupId = ctx.groupConfig.groupId;
-      const shifts = await dbAll(
-        "SELECT * FROM shifts WHERE shift_date = ? AND group_id = ? ORDER BY start_time",
-        [today, groupId]
-      );
-
-      if (!shifts.length) return ctx.reply(`📅 На ${today} смен нет`);
-
-      let message = `📅 Смены на ${today}\n`;
-      for (const shift of shifts) {
-        const status = shift.status === 'active' ? '✅' : 
-                      shift.status === 'completed' ? '⏹️' : '❌';
-        
-        message += `\n${status} @${shift.username} (${shift.full_name})\n`;
-        message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
-        if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
-      }
-
-      await ctx.reply(message);
-    } catch (err) {
-      logger.error('today error:', err);
-      await ctx.reply('❌ Ошибка получения смен');
-    }
-  });
-
-  // Photo handler
-  bot.on('photo', async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-    const timezone = ctx.groupConfig.timezone;
-
-    if (!username) return ctx.reply('❌ Установите username в Telegram');
-
-    if (!ctx.message.caption) {
-      return ctx.reply('❌ Отправьте фото с подписью');
-    }
-
-    const match = ctx.message.caption.match(
-      /^([^\n]+)\n(\d{2}:\d{2})\s(\d{2}:\d{2})\n(Зона\s+\d+)(?:\n(W\s+witag\s+\d+))?/i
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE username = ? AND group_id = ? ORDER BY shift_date DESC, start_time", 
+      [username, groupId]
     );
 
-    if (!match) {
-      return ctx.replyWithMarkdown(`
+    if (!shifts.length) return ctx.reply('📄 У вас нет смен');
+
+    let message = `📋 Ваши смены (@${username})\n`;
+    let currentDate = '';
+
+    for (const shift of shifts) {
+      if (shift.shift_date !== currentDate) {
+        currentDate = shift.shift_date;
+        message += `\n📅 *${currentDate}*\n`;
+      }
+
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `${status} ${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+      message += '\n';
+    }
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('myshifts error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
+
+bot.command('today', async (ctx) => {
+  try {
+    const today = getCurrentDate(ctx.groupConfig.timezone);
+    const groupId = ctx.groupConfig.groupId;
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE shift_date = ? AND group_id = ? ORDER BY start_time",
+      [today, groupId]
+    );
+
+    if (!shifts.length) return ctx.reply(`📅 На ${today} смен нет`);
+
+    let message = `📅 Смены на ${today}\n`;
+    for (const shift of shifts) {
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `\n${status} @${shift.username} (${shift.full_name})\n`;
+      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+    }
+
+    await ctx.reply(message);
+  } catch (err) {
+    logger.error('today error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
+
+// Photo handler
+bot.on('photo', async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+  const timezone = ctx.groupConfig.timezone;
+
+  if (!username) return ctx.reply('❌ Установите username в Telegram');
+
+  if (!ctx.message.caption) {
+    return ctx.reply('❌ Отправьте фото с подписью');
+  }
+
+  const match = ctx.message.caption.match(
+    /^([^\n]+)\n(\d{2}:\d{2})\s(\d{2}:\d{2})\n(Зона\s+\d+)(?:\n(W\s+witag\s+\d+))?/i
+  );
+
+  if (!match) {
+    return ctx.replyWithMarkdown(`
 ❌ Неверный формат. Пример:
 \`\`\`
 Имя Фамилия
@@ -282,265 +282,255 @@ W witag 1
 Зона 1
 W witag 1
 \`\`\`
-      `);
-    }
+    `);
+  }
 
-    const fullName = match[1].trim();
-    const startTime = match[2];
-    const endTime = match[3];
-    const zone = match[4].trim();
-    const witag = match[5] ? match[5].trim() : 'Нет';
+  const fullName = match[1].trim();
+  const startTime = match[2];
+  const endTime = match[3];
+  const zone = match[4].trim();
+  const witag = match[5] ? match[5].trim() : 'Нет';
 
-    if (!isValidTime(startTime) || !isValidTime(endTime)) {
-      return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
-    }
+  if (!isValidTime(startTime) || !isValidTime(endTime)) {
+    return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
+  }
 
-    try {
-      const shiftDate = getCurrentDate(timezone);
-      const existingShifts = await dbAll(
-        "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ? AND group_id = ?",
-        [username, shiftDate, groupId]
-      );
+  try {
+    const shiftDate = getCurrentDate(timezone);
+    const existingShifts = await dbAll(
+      "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ? AND group_id = ?",
+      [username, shiftDate, groupId]
+    );
 
-      for (const shift of existingShifts) {
-        if ((startTime < shift.end_time) && (endTime > shift.start_time)) {
-          return ctx.reply(
-            `❌ Пересечение с существующей сменой ${shift.start_time}-${shift.end_time}`
-          );
-        }
+    for (const shift of existingShifts) {
+      if ((startTime < shift.end_time) && (endTime > shift.start_time)) {
+        return ctx.reply(
+          `❌ Пересечение с существующей сменой ${shift.start_time}-${shift.end_time}`
+        );
       }
+    }
 
-      const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-      await dbRun(
-        `INSERT INTO shifts (group_id, username, full_name, photo_file_id, shift_date, 
-         start_time, end_time, zone, witag)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
-      );
+    const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+    await dbRun(
+      `INSERT INTO shifts (group_id, username, full_name, photo_file_id, shift_date, 
+       start_time, end_time, zone, witag)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
+    );
 
-      await ctx.replyWithMarkdown(`
+    await ctx.replyWithMarkdown(`
 ✅ *${fullName}* записан на смену
 📅 *Дата:* \`${shiftDate}\`
 ⏰ *Время:* \`${startTime}-${endTime}\`
 📍 *Зона:* \`${zone}\`
 🔖 *Witag:* \`${witag}\`
-      `);
-    } catch (err) {
-      logger.error('Shift registration error:', err);
-      await ctx.reply('❌ Ошибка регистрации смены');
-    }
-  });
-
-  // Admin handlers
-  bot.action('admin_report', async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    try {
-      const shifts = await dbAll(
-        "SELECT * FROM shifts WHERE group_id = ? ORDER BY shift_date DESC, start_time",
-        [groupId]
-      );
-
-      if (!shifts.length) return ctx.reply('📄 Смены не найдены');
-
-      let message = '📊 *Отчет по сменам*\n';
-      let currentDate = '';
-
-      for (const shift of shifts) {
-        if (shift.shift_date !== currentDate) {
-          currentDate = shift.shift_date;
-          message += `\n📅 *${currentDate}*\n`;
-        }
-
-        const status = shift.status === 'active' ? '✅' : 
-                      shift.status === 'completed' ? '⏹️' : '❌';
-        
-        message += `${status} @${shift.username} (${shift.full_name})\n`;
-        message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
-        if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
-        message += ` [ID:${shift.id}]\n`;
-      }
-
-      await ctx.replyWithMarkdown(message);
-    } catch (err) {
-      logger.error('admin_report error:', err);
-      await ctx.reply('❌ Ошибка отчета');
-    }
-  });
-
-  bot.action('active_shifts', async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    try {
-      const shifts = await dbAll(
-        "SELECT * FROM shifts WHERE status = 'active' AND group_id = ? ORDER BY shift_date, start_time",
-        [groupId]
-      );
-
-      if (!shifts.length) return ctx.reply('📄 Активных смен нет');
-
-      let message = '📋 *Активные смены*\n';
-      for (const shift of shifts) {
-        message += `\n🆔 *${shift.id}* @${shift.username} (${shift.full_name})\n`;
-        message += `📅 ${shift.shift_date} ⏰ ${shift.start_time}-${shift.end_time}\n`;
-        message += `📍 ${shift.zone}`;
-        if (shift.witag && shift.witag !== 'Нет') message += ` 🔖 ${shift.witag}`;
-      }
-
-      await ctx.replyWithMarkdown(message);
-    } catch (err) {
-      logger.error('active_shifts error:', err);
-      await ctx.reply('❌ Ошибка получения смен');
-    }
-  });
-
-  bot.action('timesheet', async (ctx) => {
-    const username = ctx.from.username;
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    try {
-      // В реальной версии здесь должна быть загрузка из Google Sheets
-      const timesheetData = [
-        ["Берикулы Айсар СС", "8", "8", "8", "8", "8", "0", "8", "8", "8", "8", "8", "8", "8", "8", "8", "", "", "210000"],
-        ["Алимжан Дархан", "8", "8", "16", "7", "16", "15", "", "8", "8", "8", "8", "8", "16", "8", "", "", "", "167500"]
-      ];
-
-      let message = '📝 *Табель учета*\n```\n';
-      for (const row of timesheetData) {
-        message += row.join('\t') + '\n';
-      }
-      message += '```';
-
-      await ctx.replyWithMarkdown(message);
-    } catch (err) {
-      logger.error('timesheet error:', err);
-      await ctx.reply('❌ Ошибка табеля');
-    }
-  });
-
-  bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'cancel';
-
-    try {
-      const shifts = await dbAll(
-        "SELECT id, username, full_name, start_time, end_time FROM shifts WHERE status = 'active' AND group_id = ?",
-        [groupId]
-      );
-
-      if (!shifts.length) return ctx.reply('📄 Активных смен нет');
-
-      const buttons = shifts.map(shift => [
-        Markup.button.callback(
-          `${shift.id} @${shift.username} ${shift.start_time}-${shift.end_time}`,
-          `${action}_shift_${shift.id}`
-        )
-      ]);
-
-      await ctx.reply(
-        `Выберите смену для ${action === 'end' ? 'завершения' : 'отмены'}:`,
-        Markup.inlineKeyboard(buttons)
-      );
-    } catch (err) {
-      logger.error('shift menu error:', err);
-      await ctx.reply('❌ Ошибка выбора смены');
-    }
-  });
-
-  bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    const shiftId = parseInt(ctx.match[2]);
-    const action = ctx.match[1].startsWith('end') ? 'end' : 'cancel';
-
-    try {
-      const shift = await dbGet(
-        "SELECT username, full_name, start_time, end_time FROM shifts WHERE id = ? AND group_id = ?",
-        [shiftId, groupId]
-      );
-
-      if (!shift) return ctx.reply('❌ Смена не найдена');
-
-      await ctx.replyWithMarkdown(
-        `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\n` +
-        `🆔 *${shiftId}* @${shift.username} (${shift.full_name})\n` +
-        `⏰ ${shift.start_time}-${shift.end_time}`,
-        shiftActionsKeyboard(shiftId)
-      );
-    } catch (err) {
-      logger.error('shift action error:', err);
-      await ctx.reply('❌ Ошибка подтверждения');
-    }
-  });
-
-  bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.answerCbQuery('🚫 Доступ запрещен');
-    }
-
-    const shiftId = parseInt(ctx.match[1]);
-    const action = ctx.callbackQuery.data.includes('end') ? 'completed' : 'canceled';
-
-    try {
-      const result = await dbRun(
-        "UPDATE shifts SET status = ? WHERE id = ? AND group_id = ?",
-        [action, shiftId, groupId]
-      );
-
-      if (result.changes > 0) {
-        await ctx.reply(`✅ Смена ${shiftId} ${action === 'completed' ? 'завершена' : 'отменена'}`);
-      } else {
-        await ctx.reply('❌ Смена не найдена');
-      }
-    } catch (err) {
-      logger.error('confirm action error:', err);
-      await ctx.reply('❌ Ошибка обновления');
-    }
-  });
-
-  bot.catch((err, ctx) => {
-    logger.error(`Error for ${ctx.updateType} in group ${config.groupId}:`, err);
-    ctx.reply('❌ Произошла ошибка');
-  });
-
-  botPool[config.groupId] = bot;
+    `);
+  } catch (err) {
+    logger.error('Shift registration error:', err);
+    await ctx.reply('❌ Ошибка регистрации смены');
+  }
 });
 
-// Start all bots
-Object.values(botPool).forEach(bot => {
-  bot.launch().then(() => logger.info('Bot started'));
+// Admin handlers
+bot.action('admin_report', async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE group_id = ? ORDER BY shift_date DESC, start_time",
+      [groupId]
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Смены не найдены');
+
+    let message = '📊 *Отчет по сменам*\n';
+    let currentDate = '';
+
+    for (const shift of shifts) {
+      if (shift.shift_date !== currentDate) {
+        currentDate = shift.shift_date;
+        message += `\n📅 *${currentDate}*\n`;
+      }
+
+      const status = shift.status === 'active' ? '✅' : 
+                    shift.status === 'completed' ? '⏹️' : '❌';
+      
+      message += `${status} @${shift.username} (${shift.full_name})\n`;
+      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+      message += ` [ID:${shift.id}]\n`;
+    }
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('admin_report error:', err);
+    await ctx.reply('❌ Ошибка отчета');
+  }
 });
+
+bot.action('active_shifts', async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE status = 'active' AND group_id = ? ORDER BY shift_date, start_time",
+      [groupId]
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Активных смен нет');
+
+    let message = '📋 *Активные смены*\n';
+    for (const shift of shifts) {
+      message += `\n🆔 *${shift.id}* @${shift.username} (${shift.full_name})\n`;
+      message += `📅 ${shift.shift_date} ⏰ ${shift.start_time}-${shift.end_time}\n`;
+      message += `📍 ${shift.zone}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` 🔖 ${shift.witag}`;
+    }
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('active_shifts error:', err);
+    await ctx.reply('❌ Ошибка получения смен');
+  }
+});
+
+bot.action('timesheet', async (ctx) => {
+  const username = ctx.from.username;
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const timesheetData = [
+      ["Берикулы Айсар СС", "8", "8", "8", "8", "8", "0", "8", "8", "8", "8", "8", "8", "8", "8", "8", "", "", "210000"],
+      ["Алимжан Дархан", "8", "8", "16", "7", "16", "15", "", "8", "8", "8", "8", "8", "16", "8", "", "", "", "167500"]
+    ];
+
+    let message = '📝 *Табель учета*\n```\n';
+    for (const row of timesheetData) {
+      message += row.join('\t') + '\n';
+    }
+    message += '```';
+
+    await ctx.replyWithMarkdown(message);
+  } catch (err) {
+    logger.error('timesheet error:', err);
+    await ctx.reply('❌ Ошибка табеля');
+  }
+});
+
+bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'cancel';
+
+  try {
+    const shifts = await dbAll(
+      "SELECT id, username, full_name, start_time, end_time FROM shifts WHERE status = 'active' AND group_id = ?",
+      [groupId]
+    );
+
+    if (!shifts.length) return ctx.reply('📄 Активных смен нет');
+
+    const buttons = shifts.map(shift => [
+      Markup.button.callback(
+        `${shift.id} @${shift.username} ${shift.start_time}-${shift.end_time}`,
+        `${action}_shift_${shift.id}`
+      )
+    ]);
+
+    await ctx.reply(
+      `Выберите смену для ${action === 'end' ? 'завершения' : 'отмены'}:`,
+      Markup.inlineKeyboard(buttons)
+    );
+  } catch (err) {
+    logger.error('shift menu error:', err);
+    await ctx.reply('❌ Ошибка выбора смены');
+  }
+});
+
+bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const shiftId = parseInt(ctx.match[2]);
+  const action = ctx.match[1].startsWith('end') ? 'end' : 'cancel';
+
+  try {
+    const shift = await dbGet(
+      "SELECT username, full_name, start_time, end_time FROM shifts WHERE id = ? AND group_id = ?",
+      [shiftId, groupId]
+    );
+
+    if (!shift) return ctx.reply('❌ Смена не найдена');
+
+    await ctx.replyWithMarkdown(
+      `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\n` +
+      `🆔 *${shiftId}* @${shift.username} (${shift.full_name})\n` +
+      `⏰ ${shift.start_time}-${shift.end_time}`,
+      shiftActionsKeyboard(shiftId)
+    );
+  } catch (err) {
+    logger.error('shift action error:', err);
+    await ctx.reply('❌ Ошибка подтверждения');
+  }
+});
+
+bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const shiftId = parseInt(ctx.match[1]);
+  const action = ctx.callbackQuery.data.includes('end') ? 'completed' : 'canceled';
+
+  try {
+    const result = await dbRun(
+      "UPDATE shifts SET status = ? WHERE id = ? AND group_id = ?",
+      [action, shiftId, groupId]
+    );
+
+    if (result.changes > 0) {
+      await ctx.reply(`✅ Смена ${shiftId} ${action === 'completed' ? 'завершена' : 'отменена'}`);
+    } else {
+      await ctx.reply('❌ Смена не найдена');
+    }
+  } catch (err) {
+    logger.error('confirm action error:', err);
+    await ctx.reply('❌ Ошибка обновления');
+  }
+});
+
+bot.catch((err, ctx) => {
+  logger.error(`Error for ${ctx.updateType}:`, err);
+  ctx.reply('❌ Произошла ошибка');
+});
+
+// Start bot
+bot.launch().then(() => logger.info('Bot started'));
 
 // Enable graceful stop
-process.once('SIGINT', () => {
-  Object.values(botPool).forEach(bot => bot.stop('SIGINT'));
-});
-process.once('SIGTERM', () => {
-  Object.values(botPool).forEach(bot => bot.stop('SIGTERM'));
-});
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
