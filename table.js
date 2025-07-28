@@ -34,10 +34,10 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
 
   groupConfigs.push({
     groupId,
-    adminUsernames: adminUsernames.split(',').map(u => u.trim()),
+    adminUsernames: adminUsernames.split(',').map(u => u.trim().replace('@', '')),
     timezone: groupTimezone
   });
-  console.log('Loaded group config:', { groupId, adminUsernames, timezone: groupTimezone });
+  console.log('Loaded group config:', { groupId, adminUsernames: adminUsernames.split(',').map(u => u.trim()), timezone: groupTimezone });
 
   groupIndex++;
 }
@@ -59,7 +59,7 @@ db.serialize(() => {
       username TEXT NOT NULL,
       full_name TEXT NOT NULL,
       photo_file_id TEXT,
-      shift_date TEXT NOT NOT NULL,
+      shift_date TEXT NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
       actual_end_time TEXT,
@@ -110,7 +110,7 @@ const getGroupConfig = (groupId) => {
 };
 
 const isAdmin = (username, adminUsernames) => {
-  return adminUsernames.includes(username);
+  return adminUsernames.includes(username.replace('@', ''));
 };
 
 const getCurrentDate = (timezone) => {
