@@ -3,6 +3,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { Telegraf, Markup } = require('telegraf');
 const { format } = require('date-fns');
 const winston = require('winston');
+const { google } = require('googleapis');
 
 // Configure logging
 const logger = winston.createLogger({
@@ -18,6 +19,14 @@ const logger = winston.createLogger({
     new winston.transports.File({ filename: 'bot.log' })
   ]
 });
+
+// Initialize Google Sheets API
+const auth = new google.auth.GoogleAuth({
+  keyFile: process.env.GOOGLE_SHEETS_CREDENTIALS_PATH,
+  scopes: ['https://www.googleapis.com/auth/spreadsheets']
+});
+const sheets = google.sheets({ version: 'v4', auth });
+const spreadsheetId = '1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE';
 
 // Load group configurations from .env
 const groupConfigs = [];
@@ -101,6 +110,11 @@ const dbRun = (query, params = []) => {
 };
 
 // Helper functions
+const escapeMarkdownV2 = (text) => {
+  if (!text) return text;
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+};
+
 const getGroupConfig = (groupId) => {
   const config = groupConfigs.find(config => config.groupId === groupId);
   return config ? {
@@ -188,8 +202,8 @@ bot.command('admin', async (ctx) => {
 });
 
 bot.command(['start', 'help'], async (ctx) => {
-  await ctx.replyWithMarkdown(`
-👋 Бот для учета смен. Отправьте фото с подписью в формате:
+  await ctx.replyWithMarkdownV2(`
+👋 Бот для учета смен\\. Отправьте фото с подписью в формате:
 
 \`\`\`
 Имя Фамилия
@@ -199,9 +213,9 @@ W witag 1
 \`\`\`
 
 *Команды:*
-/myshifts - Ваши смены
-/today - Смены сегодня
-/admin - Админ панель
+/myshifts \\- Ваши смены
+/today \\- Смены сегодня
+/admin \\- Админ панель
   `);
 });
 
@@ -219,24 +233,24 @@ bot.command('myshifts', async (ctx) => {
 
     if (!shifts.length) return ctx.reply('📄 У вас нет смен');
 
-    let message = `📋 Ваши смены (@${username})\n`;
+    let message = `📋 Ваши смены \\(@${escapeMarkdownV2(username)}\\)\\n`;
     let currentDate = '';
 
     for (const shift of shifts) {
       if (shift.shift_date !== currentDate) {
         currentDate = shift.shift_date;
-        message += `\n📅 *${currentDate}*\n`;
+        message += `\\n📅 *${escapeMarkdownV2(currentDate)}*\\n`;
       }
 
       const status = shift.status === 'active' ? '✅' : 
                     shift.status === 'completed' ? '⏹️' : '❌';
       
-      message += `${status} ${shift.start_time}-${shift.end_time} ${shift.zone}`;
-      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
-      message += '\n';
+      message += `${status} ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)} ${escapeMarkdownV2(shift.zone)}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` \\(${escapeMarkdownV2(shift.witag)}\\)`;
+      message += '\\n';
     }
 
-    await ctx.replyWithMarkdown(message);
+    await ctx.replyWithMarkdownV2(message);
   } catch (err) {
     logger.error('myshifts error:', err);
     await ctx.reply('❌ Ошибка получения смен');
@@ -254,17 +268,17 @@ bot.command('today', async (ctx) => {
 
     if (!shifts.length) return ctx.reply(`📅 На ${today} смен нет`);
 
-    let message = `📅 Смены на ${today}\n`;
+    let message = `📅 Смены на ${escapeMarkdownV2(today)}\\n`;
     for (const shift of shifts) {
       const status = shift.status === 'active' ? '✅' : 
                     shift.status === 'completed' ? '⏹️' : '❌';
       
-      message += `\n${status} @${shift.username} (${shift.full_name})\n`;
-      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
-      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
+      message += `\\n${status} @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n`;
+      message += `${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)} ${escapeMarkdownV2(shift.zone)}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` \\(${escapeMarkdownV2(shift.witag)}\\)`;
     }
 
-    await ctx.reply(message);
+    await ctx.replyWithMarkdownV2(message);
   } catch (err) {
     logger.error('today error:', err);
     await ctx.reply('❌ Ошибка получения смен');
@@ -288,8 +302,8 @@ bot.on('photo', async (ctx) => {
   );
 
   if (!match) {
-    return ctx.replyWithMarkdown(`
-❌ Неверный формат. Пример:
+    return ctx.replyWithMarkdownV2(`
+❌ Неверный формат\\. Пример:
 \`\`\`
 Имя Фамилия
 07:00 15:00
@@ -301,7 +315,7 @@ W witag 1
 
   const fullName = match[1].trim();
   const startTime = match[2];
-  const endTime = match[3];
+  const endTime = [3];
   const zone = match[4].trim();
   const witag = match[5] ? match[5].trim() : 'Нет';
 
@@ -332,12 +346,32 @@ W witag 1
       [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
     );
 
-    await ctx.replyWithMarkdown(`
-✅ *${fullName}* записан на смену
-📅 *Дата:* \`${shiftDate}\`
-⏰ *Время:* \`${startTime}-${endTime}\`
-📍 *Зона:* \`${zone}\`
-🔖 *Witag:* \`${witag}\`
+    // Append to Google Sheets (Timesheet)
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'Timesheet!A:I',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [[
+          groupId,
+          username,
+          fullName,
+          photoId,
+          shiftDate,
+          startTime,
+          endTime,
+          zone,
+          witag
+        ]]
+      }
+    });
+
+    await ctx.replyWithMarkdownV2(`
+✅ *${escapeMarkdownV2(fullName)}* записан на смену
+📅 *Дата:* \`${escapeMarkdownV2(shiftDate)}\`
+⏰ *Время:* \`${escapeMarkdownV2(startTime)}\\-${escapeMarkdownV2(endTime)}\`
+📍 *Зона:* \`${escapeMarkdownV2(zone)}\`
+🔖 *Witag:* \`${escapeMarkdownV2(witag)}\`
     `);
   } catch (err) {
     logger.error('Shift registration error:', err);
@@ -362,25 +396,25 @@ bot.action('admin_report', async (ctx) => {
 
     if (!shifts.length) return ctx.reply('📄 Смены не найдены');
 
-    let message = '📊 *Отчет по сменам*\n';
+    let message = '📊 *Отчет по сменам*\\n';
     let currentDate = '';
 
     for (const shift of shifts) {
       if (shift.shift_date !== currentDate) {
         currentDate = shift.shift_date;
-        message += `\n📅 *${currentDate}*\n`;
+        message += `\\n📅 *${escapeMarkdownV2(currentDate)}*\\n`;
       }
 
       const status = shift.status === 'active' ? '✅' : 
                     shift.status === 'completed' ? '⏹️' : '❌';
       
-      message += `${status} @${shift.username} (${shift.full_name})\n`;
-      message += `${shift.start_time}-${shift.end_time} ${shift.zone}`;
-      if (shift.witag && shift.witag !== 'Нет') message += ` (${shift.witag})`;
-      message += ` [ID:${shift.id}]\n`;
+      message += `${status} @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n`;
+      message += `${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)} ${escapeMarkdownV2(shift.zone)}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` \\(${escapeMarkdownV2(shift.witag)}\\)`;
+      message += ` \\[ID:${shift.id}\\]\\n`;
     }
 
-    await ctx.replyWithMarkdown(message);
+    await ctx.replyWithMarkdownV2(message);
   } catch (err) {
     logger.error('admin_report error:', err);
     await ctx.reply('❌ Ошибка отчета');
@@ -403,15 +437,15 @@ bot.action('active_shifts', async (ctx) => {
 
     if (!shifts.length) return ctx.reply('📄 Активных смен нет');
 
-    let message = '📋 *Активные смены*\n';
+    let message = '📋 *Активные смены*\\n';
     for (const shift of shifts) {
-      message += `\n🆔 *${shift.id}* @${shift.username} (${shift.full_name})\n`;
-      message += `📅 ${shift.shift_date} ⏰ ${shift.start_time}-${shift.end_time}\n`;
-      message += `📍 ${shift.zone}`;
-      if (shift.witag && shift.witag !== 'Нет') message += ` 🔖 ${shift.witag}`;
+      message += `\\n🆔 *${shift.id}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n`;
+      message += `📅 ${escapeMarkdownV2(shift.shift_date)} ⏰ ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}\\n`;
+      message += `📍 ${escapeMarkdownV2(shift.zone)}`;
+      if (shift.witag && shift.witag !== 'Нет') message += ` 🔖 ${escapeMarkdownV2(shift.witag)}`;
     }
 
-    await ctx.replyWithMarkdown(message);
+    await ctx.replyWithMarkdownV2(message);
   } catch (err) {
     logger.error('active_shifts error:', err);
     await ctx.reply('❌ Ошибка получения смен');
@@ -425,18 +459,63 @@ bot.action('timesheet', async (ctx) => {
   }
 
   try {
-    const timesheetData = [
-      ["Берикулы Айсар СС", "8", "8", "8", "8", "8", "0", "8", "8", "8", "8", "8", "8", "8", "8", "8", "", "", "210000"],
-      ["Алимжан Дархан", "8", "8", "16", "7", "16", "15", "", "8", "8", "8", "8", "8", "16", "8", "", "", "", "167500"]
-    ];
+    const shifts = await dbAll(
+      "SELECT * FROM shifts WHERE group_id = ? ORDER BY full_name, shift_date",
+      [ctx.groupConfig.groupId]
+    );
 
-    let message = '📝 *Табель учета*\n```\n';
+    if (!shifts.length) return ctx.reply('📄 Смены не найдены');
+
+    // Group shifts by user
+    const userShifts = {};
+    for (const shift of shifts) {
+      if (!userShifts[shift.full_name]) {
+        userShifts[shift.full_name] = [];
+      }
+      userShifts[shift.full_name].push(shift);
+    }
+
+    // Generate timesheet data
+    const timesheetData = [];
+    const dates = [...new Set(shifts.map(s => s.shift_date))].sort();
+    for (const [fullName, userShiftList] of Object.entries(userShifts)) {
+      const row = [fullName];
+      let totalHours = 0;
+      for (const date of dates) {
+        const shift = userShiftList.find(s => s.shift_date === date);
+        if (shift && shift.status === 'completed') {
+          const hours = parseInt(shift.worked_hours.split('h')[0]) || 0;
+          row.push(hours.toString());
+          totalHours += hours;
+        } else {
+          row.push('');
+        }
+      }
+      row.push('', totalHours.toString());
+      timesheetData.push(row);
+    }
+
+    // Update Google Sheets (Report)
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: 'Report!A1',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [
+          ['Full Name', ...dates, 'Total Hours'],
+          ...timesheetData
+        ]
+      }
+    });
+
+    let message = '📝 *Табель учета*\\n```\\n';
+    message += ['Full Name', ...dates, 'Total Hours'].map(escapeMarkdownV2).join('\t') + '\\n';
     for (const row of timesheetData) {
-      message += row.join('\t') + '\n';
+      message += row.map(escapeMarkdownV2).join('\t') + '\\n';
     }
     message += '```';
 
-    await ctx.replyWithMarkdown(message);
+    await ctx.replyWithMarkdownV2(message);
   } catch (err) {
     logger.error('timesheet error:', err);
     await ctx.reply('❌ Ошибка табеля');
@@ -463,7 +542,7 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
 
     const buttons = shifts.map(shift => [
       Markup.button.callback(
-        `${shift.id} @${shift.username} ${shift.start_time}-${shift.end_time}`,
+        `${shift.id} @${escapeMarkdownV2(shift.username)} ${shift.start_time}-${shift.end_time}`,
         `${action}_shift_${shift.id}`
       )
     ]);
@@ -497,10 +576,10 @@ bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
 
     if (!shift) return ctx.reply('❌ Смена не найдена');
 
-    await ctx.replyWithMarkdown(
-      `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\n` +
-      `🆔 *${shiftId}* @${shift.username} (${shift.full_name})\n` +
-      `⏰ ${shift.start_time}-${shift.end_time}`,
+    await ctx.replyWithMarkdownV2(
+      `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\\n` +
+      `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n` +
+      `⏰ ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}`,
       shiftActionsKeyboard(shiftId)
     );
   } catch (err) {
@@ -521,9 +600,16 @@ bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
   const action = ctx.callbackQuery.data.includes('end') ? 'completed' : 'canceled';
 
   try {
+    const shift = await dbGet(
+      "SELECT start_time, end_time FROM shifts WHERE id = ? AND group_id = ?",
+      [shiftId, groupId]
+    );
+
+    const workedHours = action === 'completed' ? calculateWorkedHours(shift.start_time, shift.end_time) : null;
+
     const result = await dbRun(
-      "UPDATE shifts SET status = ? WHERE id = ? AND group_id = ?",
-      [action, shiftId, groupId]
+      "UPDATE shifts SET status = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
+      [action, workedHours, shiftId, groupId]
     );
 
     if (result.changes > 0) {
