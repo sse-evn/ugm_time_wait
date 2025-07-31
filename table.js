@@ -25,7 +25,7 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 const sheets = google.sheets({ version: 'v4', auth });
-const spreadsheetId = '1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE';
+const spreadsheetId = process.env.SPREADSHEET_ID;
 
 const groupConfigs = [];
 let groupIndex = 1;
@@ -34,11 +34,6 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
   const adminUsernames = process.env[`GROUP${groupIndex}_ADMINS`];
   const groupTimezone = process.env[`GROUP${groupIndex}_TIMEZONE`];
 
-  if (!adminUsernames || !groupTimezone) {
-    logger.error(`Incomplete configuration for GROUP${groupIndex}`);
-    process.exit(1);
-  }
-
   groupConfigs.push({
     groupId,
     adminUsernames: adminUsernames.split(',').map(u => u.trim().replace('@', '')),
@@ -46,11 +41,6 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
   });
 
   groupIndex++;
-}
-
-if (groupConfigs.length === 0) {
-  logger.error('No group configurations found in .env');
-  process.exit(1);
 }
 
 const db = new sqlite3.Database('shifts.db');
@@ -84,7 +74,6 @@ const escapeMarkdownV2 = (text) => (text || '').replace(/([_*[\]()~`>#+\-=|{}.!]
 const getGroupConfig = (groupId) => groupConfigs.find(config => config.groupId === groupId) || { botToken: process.env.BOT_TOKEN };
 const isAdmin = (username, adminUsernames) => adminUsernames.includes(username.replace('@', ''));
 const getCurrentDate = (timezone) => {
-  if (!timezone) throw new Error('Timezone is undefined');
   return new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: '2-digit', timeZone: timezone }).format(new Date()).split('/').join('.');
 };
 const isValidTime = (time) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(time);
@@ -130,106 +119,97 @@ bot.use(async (ctx, next) => {
 });
 
 async function ensureSheetExists(spreadsheetId, sheetName) {
-  try {
-    const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
-    const sheetExists = spreadsheet.data.sheets.some(sheet => sheet.properties.title === sheetName);
-    
-    if (!sheetExists) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        resource: {
-          requests: [{
-            addSheet: {
-              properties: {
-                title: sheetName,
-                gridProperties: {
-                  rowCount: 100,
-                  columnCount: 37
-                }
+  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheetExists = spreadsheet.data.sheets.some(sheet => sheet.properties.title === sheetName);
+  
+  if (!sheetExists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: {
+        requests: [{
+          addSheet: {
+            properties: {
+              title: sheetName,
+              gridProperties: {
+                rowCount: 100,
+                columnCount: 38
               }
             }
-          }]
-        }
-      });
+          }
+        }]
+      }
+    });
 
-      await applySheetFormatting(spreadsheetId, sheetName);
-    }
-  } catch (err) {
-    logger.error(`Error ensuring sheet exists (${sheetName}):`, err);
-    throw err;
+    await applySheetFormatting(spreadsheetId, sheetName);
   }
 }
 
 async function applySheetFormatting(spreadsheetId, sheetName) {
-  try {
-    const requests = [
-      {
-        repeatCell: {
-          range: {
-            sheetId: await getSheetId(spreadsheetId, sheetName),
-            startRowIndex: 0,
-            endRowIndex: 1
-          },
-          cell: {
-            userEnteredFormat: {
-              backgroundColor: { red: 0.2, green: 0.6, blue: 0.8 },
-              textFormat: { bold: true, fontSize: 12 }
-            }
-          },
-          fields: "userEnteredFormat(backgroundColor,textFormat)"
-        }
-      },
-      {
-        addConditionalFormatRule: {
-          rule: {
-            ranges: [{
-              sheetId: await getSheetId(spreadsheetId, sheetName),
-              startRowIndex: 1
-            }],
-            booleanRule: {
-              condition: {
-                type: 'CUSTOM_FORMULA',
-                values: [{ userEnteredValue: '=MOD(ROW(),2)=0' }]
-              },
-              format: {
-                backgroundColor: { red: 0.95, green: 0.95, blue: 0.95 }
-              }
-            }
-          },
-          index: 0
-        }
-      },
-      {
-        addConditionalFormatRule: {
-          rule: {
-            ranges: [{
-              sheetId: await getSheetId(spreadsheetId, sheetName),
-              startRowIndex: 1,
-              startColumnIndex: 1,
-              endColumnIndex: 32
-            }],
-            booleanRule: {
-              condition: {
-                type: 'CUSTOM_FORMULA',
-                values: [{ userEnteredValue: '=OR(WEEKDAY(DATE($B$1,$A$1,COLUMN()-1),2)>5)' }]
-              },
-              format: {
-                backgroundColor: { red: 1, green: 0.8, blue: 0.8 }
-              }
-            }
-          },
-          index: 1
-        }
+  const requests = [
+    {
+      repeatCell: {
+        range: {
+          sheetId: await getSheetId(spreadsheetId, sheetName),
+          startRowIndex: 0,
+          endRowIndex: 1
+        },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: { red: 0.2, green: 0.6, blue: 0.8 },
+            textFormat: { bold: true, fontSize: 12 }
+          }
+        },
+        fields: "userEnteredFormat(backgroundColor,textFormat)"
       }
-    ];
+    },
+    {
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [{
+            sheetId: await getSheetId(spreadsheetId, sheetName),
+            startRowIndex: 1
+          }],
+          booleanRule: {
+            condition: {
+              type: 'CUSTOM_FORMULA',
+              values: [{ userEnteredValue: '=MOD(ROW(),2)=0' }]
+            },
+            format: {
+              backgroundColor: { red: 0.95, green: 0.95, blue: 0.95 }
+            }
+          }
+        },
+        index: 0
+      }
+    },
+    {
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [{
+            sheetId: await getSheetId(spreadsheetId, sheetName),
+            startRowIndex: 1,
+            startColumnIndex: 1,
+            endColumnIndex: 33
+          }],
+          booleanRule: {
+            condition: {
+              type: 'CUSTOM_FORMULA',
+              values: [{ userEnteredValue: '=OR(WEEKDAY(DATE($B$1,$A$1,COLUMN()-1),2)>5)' }]
+            },
+            format: {
+              backgroundColor: { red: 1, green: 0.8, blue: 0.8 }
+            }
+          }
+        },
+        index: 1
+      }
+    }
+  ];
 
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      resource: { requests }
-    });
-  } catch (err) {
-    logger.error('Error applying sheet formatting:', err);
-  }
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    resource: { requests }
+  });
 }
 
 async function getSheetId(spreadsheetId, sheetName) {
@@ -239,123 +219,113 @@ async function getSheetId(spreadsheetId, sheetName) {
 }
 
 async function updateReportSheet(groupId, weekFilter = null) {
-  try {
-    const currentDate = new Date();
-    const currentMonth = currentDate.getMonth() + 1;
-    const currentYear = currentDate.getFullYear();
-    const daysInMonth = new Date(currentYear, currentMonth, 0).getDate();
+  const currentDate = new Date();
+  const currentMonth = currentDate.getMonth() + 1;
+  const currentYear = currentDate.getFullYear();
+  const daysInMonth = new Date(currentYear, currentMonth, 0).getDate();
 
-    let startDate, endDate;
-    if (weekFilter === 'current') {
-      const currentWeek = getWeek(currentDate);
-      startDate = addDays(currentDate, -currentDate.getDay() + 1);
-      endDate = addDays(startDate, 6);
-    } else if (weekFilter === 'previous') {
-      const prevWeekDate = addDays(currentDate, -7);
-      const prevWeek = getWeek(prevWeekDate);
-      startDate = addDays(prevWeekDate, -prevWeekDate.getDay() + 1);
-      endDate = addDays(startDate, 6);
-    } else if (weekFilter === 'next') {
-      const nextWeekDate = addDays(currentDate, 7);
-      const nextWeek = getWeek(nextWeekDate);
-      startDate = addDays(nextWeekDate, -nextWeekDate.getDay() + 1);
-      endDate = addDays(startDate, 6);
-    } else {
-      startDate = new Date(currentYear, currentMonth - 1, 1);
-      endDate = new Date(currentYear, currentMonth, 0);
-    }
-
-    const users = await dbAll(
-      "SELECT DISTINCT username, full_name FROM shifts WHERE group_id = ?",
-      [groupId]
-    );
-
-    const shifts = await dbAll(
-      `SELECT username, full_name, shift_date, start_time, end_time 
-       FROM shifts 
-       WHERE group_id = ? 
-         AND date(shift_date, 'unixepoch') BETWEEN date(?, 'unixepoch') AND date(?, 'unixepoch')`,
-      [groupId, Math.floor(startDate.getTime()/1000), Math.floor(endDate.getTime()/1000)]
-    );
-
-    const reportData = {};
-    users.forEach(user => {
-      reportData[user.username] = {
-        fullName: user.full_name,
-        days: {},
-        totalShifts: 0,
-        totalHours: 0
-      };
-    });
-
-    shifts.forEach(shift => {
-      const day = parseInt(shift.shift_date.split('.')[0]);
-      if (reportData[shift.username]) {
-        reportData[shift.username].days[day] = 
-          `${shift.start_time}-${shift.end_time}`;
-        reportData[shift.username].totalShifts++;
-        
-        const [startH, startM] = shift.start_time.split(':').map(Number);
-        const [endH, endM] = shift.end_time.split(':').map(Number);
-        let hours = endH - startH;
-        let minutes = endM - startM;
-        if (minutes < 0) {
-          hours--;
-          minutes += 60;
-        }
-        reportData[shift.username].totalHours += hours + (minutes / 60);
-      }
-    });
-
-    const headers = ['ФИО'];
-    const dayHeaders = [];
-    for (let day = 1; day <= daysInMonth; day++) {
-      const date = new Date(currentYear, currentMonth - 1, day);
-      headers.push(`${day}\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
-      dayHeaders.push(day);
-    }
-    headers.push('Всего смен', 'Всего часов');
-
-    const values = [headers];
-    Object.values(reportData).forEach(userData => {
-      const row = [userData.fullName];
-      dayHeaders.forEach(day => {
-        row.push(userData.days[day] || '');
-      });
-      row.push(userData.totalShifts);
-      row.push(userData.totalHours.toFixed(1));
-      values.push(row);
-    });
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId,
-      range: `Report!A1:AG`,
-      valueInputOption: 'RAW',
-      resource: { values }
-    });
-
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      resource: {
-        requests: [{
-          autoResizeDimensions: {
-            dimensions: {
-              sheetId: await getSheetId(spreadsheetId, 'Report'),
-              dimension: 'COLUMNS',
-              startIndex: 0,
-              endIndex: headers.length
-            }
-          }
-        }]
-      }
-    });
-
-    logger.info('Report sheet updated successfully');
-    return { startDate, endDate };
-  } catch (err) {
-    logger.error('Error updating report sheet:', err);
-    throw err;
+  let startDate, endDate;
+  if (weekFilter === 'current') {
+    startDate = addDays(currentDate, -currentDate.getDay() + 1);
+    endDate = addDays(startDate, 6);
+  } else if (weekFilter === 'previous') {
+    const prevWeekDate = addDays(currentDate, -7);
+    startDate = addDays(prevWeekDate, -prevWeekDate.getDay() + 1);
+    endDate = addDays(startDate, 6);
+  } else if (weekFilter === 'next') {
+    const nextWeekDate = addDays(currentDate, 7);
+    startDate = addDays(nextWeekDate, -nextWeekDate.getDay() + 1);
+    endDate = addDays(startDate, 6);
+  } else {
+    startDate = new Date(currentYear, currentMonth - 1, 1);
+    endDate = new Date(currentYear, currentMonth, 0);
   }
+
+  const users = await dbAll(
+    "SELECT DISTINCT username, full_name FROM shifts WHERE group_id = ?",
+    [groupId]
+  );
+
+  const shifts = await dbAll(
+    `SELECT username, full_name, shift_date, start_time, end_time 
+     FROM shifts 
+     WHERE group_id = ? 
+       AND date(shift_date, 'unixepoch') BETWEEN date(?, 'unixepoch') AND date(?, 'unixepoch')`,
+    [groupId, Math.floor(startDate.getTime()/1000), Math.floor(endDate.getTime()/1000)]
+  );
+
+  const reportData = {};
+  users.forEach(user => {
+    reportData[user.username] = {
+      fullName: user.full_name,
+      days: {},
+      totalShifts: 0,
+      totalHours: 0
+    };
+  });
+
+  shifts.forEach(shift => {
+    const day = parseInt(shift.shift_date.split('.')[0]);
+    if (reportData[shift.username]) {
+      reportData[shift.username].days[day] = `${shift.start_time}-${shift.end_time}`;
+      reportData[shift.username].totalShifts++;
+      
+      const [startH, startM] = shift.start_time.split(':').map(Number);
+      const [endH, endM] = shift.end_time.split(':').map(Number);
+      let hours = endH - startH;
+      let minutes = endM - startM;
+      if (minutes < 0) {
+        hours--;
+        minutes += 60;
+      }
+      reportData[shift.username].totalHours += hours + (minutes / 60);
+    }
+  });
+
+  const headers = ['ФИО'];
+  const dayHeaders = [];
+  for (let day = 1; day <= daysInMonth; day++) {
+    const date = new Date(currentYear, currentMonth - 1, day);
+    headers.push(`${day}\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
+    dayHeaders.push(day);
+  }
+  headers.push('Всего смен', 'Всего часов');
+
+  const values = [headers];
+  Object.values(reportData).forEach(userData => {
+    const row = [userData.fullName];
+    dayHeaders.forEach(day => {
+      row.push(userData.days[day] || '');
+    });
+    row.push(userData.totalShifts);
+    row.push(userData.totalHours.toFixed(1));
+    values.push(row);
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `Report!A1:AH`,
+    valueInputOption: 'RAW',
+    resource: { values }
+  });
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    resource: {
+      requests: [{
+        autoResizeDimensions: {
+          dimensions: {
+            sheetId: await getSheetId(spreadsheetId, 'Report'),
+            dimension: 'COLUMNS',
+            startIndex: 0,
+            endIndex: headers.length + 1
+          }
+        }
+      }]
+    }
+  });
+
+  return { startDate, endDate };
 }
 
 bot.command('admin', async (ctx) => {
