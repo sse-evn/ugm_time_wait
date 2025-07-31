@@ -1,10 +1,14 @@
 require('dotenv').config();
+
 const sqlite3 = require('sqlite3').verbose();
 const { Telegraf, Markup } = require('telegraf');
 const { format, getWeek, addDays } = require('date-fns');
 const winston = require('winston');
 const { google } = require('googleapis');
 const cron = require('node-cron');
+
+if (!process.env.SPREADSHEET_ID) throw new Error('SPREADSHEET_ID не указан');
+const spreadsheetId = process.env.SPREADSHEET_ID;
 
 const logger = winston.createLogger({
   level: 'debug',
@@ -25,7 +29,6 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 const sheets = google.sheets({ version: 'v4', auth });
-const spreadsheetId = process.env.SPREADSHEET_ID;
 
 const groupConfigs = [];
 let groupIndex = 1;
@@ -39,7 +42,6 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
     adminUsernames: adminUsernames.split(',').map(u => u.trim().replace('@', '')),
     timezone: groupTimezone
   });
-
   groupIndex++;
 }
 
@@ -89,10 +91,8 @@ const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📊 Отчет', 'admin_report')],
   [Markup.button.callback('📋 Активные', 'active_shifts')],
   [Markup.button.callback('📝 Табель', 'timesheet')],
-  [
-    Markup.button.callback('🛑 Завершить смену', 'end_shift_menu'),
-    Markup.button.callback('📋 /shifts', 'show_shifts_report')
-  ]
+  [Markup.button.callback('🛑 Завершить смену', 'end_shift_menu')],
+  [Markup.button.callback('📋 /shifts', 'show_shifts_report')]
 ]);
 
 const weekFilterKeyboard = Markup.inlineKeyboard([
@@ -117,7 +117,7 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-async function ensureSheetExists(spreadsheetId, sheetName) {
+async function ensureSheetExists(sheetName) {
   const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
   const sheetExists = spreadsheet.data.sheets.some(sheet => sheet.properties.title === sheetName);
   
@@ -138,83 +138,7 @@ async function ensureSheetExists(spreadsheetId, sheetName) {
         }]
       }
     });
-
-    await applySheetFormatting(spreadsheetId, sheetName);
   }
-}
-
-async function applySheetFormatting(spreadsheetId, sheetName) {
-  const requests = [
-    {
-      repeatCell: {
-        range: {
-          sheetId: await getSheetId(spreadsheetId, sheetName),
-          startRowIndex: 0,
-          endRowIndex: 1
-        },
-        cell: {
-          userEnteredFormat: {
-            backgroundColor: { red: 0.2, green: 0.6, blue: 0.8 },
-            textFormat: { bold: true, fontSize: 12 }
-          }
-        },
-        fields: "userEnteredFormat(backgroundColor,textFormat)"
-      }
-    },
-    {
-      addConditionalFormatRule: {
-        rule: {
-          ranges: [{
-            sheetId: await getSheetId(spreadsheetId, sheetName),
-            startRowIndex: 1
-          }],
-          booleanRule: {
-            condition: {
-              type: 'CUSTOM_FORMULA',
-              values: [{ userEnteredValue: '=MOD(ROW(),2)=0' }]
-            },
-            format: {
-              backgroundColor: { red: 0.95, green: 0.95, blue: 0.95 }
-            }
-          }
-        },
-        index: 0
-      }
-    },
-    {
-      addConditionalFormatRule: {
-        rule: {
-          ranges: [{
-            sheetId: await getSheetId(spreadsheetId, sheetName),
-            startRowIndex: 1,
-            startColumnIndex: 1,
-            endColumnIndex: 33
-          }],
-          booleanRule: {
-            condition: {
-              type: 'CUSTOM_FORMULA',
-              values: [{ userEnteredValue: '=OR(WEEKDAY(DATE($B$1,$A$1,COLUMN()-1),2)>5)' }]
-            },
-            format: {
-              backgroundColor: { red: 1, green: 0.8, blue: 0.8 }
-            }
-          }
-        },
-        index: 1
-      }
-    }
-  ];
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    resource: { requests }
-  });
-}
-
-async function getSheetId(spreadsheetId, sheetName) {
-  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
-  const sheet = spreadsheet.data.sheets.find(s => s.properties.title === sheetName);
-  return sheet.properties.sheetId;
 }
 
 async function updateReportSheet(groupId, weekFilter = null) {
@@ -285,7 +209,7 @@ async function updateReportSheet(groupId, weekFilter = null) {
   const dayHeaders = [];
   for (let day = 1; day <= daysInMonth; day++) {
     const date = new Date(currentYear, currentMonth - 1, day);
-    headers.push(`${day}\\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
+    headers.push(`${day}\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
     dayHeaders.push(day);
   }
   headers.push('Всего смен', 'Всего часов');
@@ -307,24 +231,6 @@ async function updateReportSheet(groupId, weekFilter = null) {
     valueInputOption: 'RAW',
     resource: { values }
   });
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    resource: {
-      requests: [{
-        autoResizeDimensions: {
-          dimensions: {
-            sheetId: await getSheetId(spreadsheetId, 'Report'),
-            dimension: 'COLUMNS',
-            startIndex: 0,
-            endIndex: headers.length + 1
-          }
-        }
-      }]
-    }
-  });
-
-  return { startDate, endDate };
 }
 
 bot.command('admin', async (ctx) => {
@@ -440,9 +346,8 @@ W witag 1
       [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
     );
 
-    const timesheetRange = 'Timesheet!A:K';
-    await ensureSheetExists(spreadsheetId, 'Timesheet');
-    const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
+    await ensureSheetExists('Timesheet');
+    const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Timesheet!A:K' });
     const timesheetValues = timesheetResponse.data.values || [];
     const existingRowIndex = timesheetValues.findIndex(row => row[2] === `@${username}`);
 
@@ -479,7 +384,7 @@ W witag 1
       ];
       await sheets.spreadsheets.values.append({
         spreadsheetId,
-        range: timesheetRange,
+        range: 'Timesheet!A:K',
         valueInputOption: 'RAW',
         resource: { values: [newRow] },
       });
@@ -686,8 +591,8 @@ bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
       ['completed', workedHours, shiftId, groupId]
     );
 
-    const timesheetRange = 'Timesheet!A:K';
-    const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
+    await ensureSheetExists('Timesheet');
+    const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Timesheet!A:K' });
     const timesheetValues = timesheetResponse.data.values || [];
     const existingRowIndex = timesheetValues.findIndex(row => row[2] === `@${shift.username}`);
     if (existingRowIndex >= 0) {
@@ -762,8 +667,8 @@ groupConfigs.forEach(config => {
           ['completed', workedHours, shift.id, config.groupId]
         );
 
-        const timesheetRange = 'Timesheet!A:K';
-        const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
+        await ensureSheetExists('Timesheet');
+        const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Timesheet!A:K' });
         const timesheetValues = timesheetResponse.data.values || [];
         const existingRowIndex = timesheetValues.findIndex(row => row[2] === `@${shift.username}`);
         if (existingRowIndex >= 0) {
