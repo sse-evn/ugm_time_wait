@@ -4,6 +4,7 @@ const { Telegraf, Markup } = require('telegraf');
 const { format } = require('date-fns');
 const winston = require('winston');
 const { google } = require('googleapis');
+const cron = require('node-cron');
 
 // Configure logging
 const logger = winston.createLogger({
@@ -128,13 +129,11 @@ const isAdmin = (username, adminUsernames) => {
 };
 
 const getCurrentDate = (timezone) => {
-  console.log('Timezone:', timezone);
   if (!timezone) throw new Error('Timezone is undefined');
   try {
     return new Intl.DateTimeFormat('en-GB', {
       day: '2-digit',
       month: '2-digit',
-      year: '2-digit',
       timeZone: timezone,
     }).format(new Date()).split('/').join('.');
   } catch (err) {
@@ -162,6 +161,7 @@ const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📝 Табель', 'timesheet')],
   [
     Markup.button.callback('🛑 Завершить', 'end_shift_menu'),
+    Markup.button.callback('🔚 Завершить вручную', 'manual_end_shift_menu'),
     Markup.button.callback('❌ Отменить', 'cancel_shift_menu')
   ]
 ]);
@@ -190,6 +190,76 @@ bot.use(async (ctx, next) => {
 
   ctx.groupConfig = groupConfig;
   return next();
+});
+
+// Cron job for marking day off at 18:16
+groupConfigs.forEach(config => {
+  cron.schedule('16 18 * * *', async () => {
+    try {
+      const shiftDate = getCurrentDate(config.timezone);
+      const sheetName = 'Sheet1';
+      const sheetRange = `${sheetName}!A:G`;
+
+      // Get all employees from Google Sheets
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: sheetRange,
+      });
+
+      const values = response.data.values || [];
+      if (values.length === 0) return;
+
+      // Skip header row
+      const employees = values.slice(1);
+
+      for (const row of employees) {
+        const username = row[2]?.replace('@', '');
+        const fullName = row[1];
+        const existingDates = (row[5] || '').split(',').map(s => s.trim());
+
+        // Check if employee had a shift today
+        const shifts = await dbAll(
+          "SELECT * FROM shifts WHERE username = ? AND shift_date = ? AND group_id = ?",
+          [username, shiftDate, config.groupId]
+        );
+
+        // Skip if employee had a shift or already marked as day off
+        if (shifts.length > 0 || existingDates.includes(`${shiftDate} (выходной)`)) {
+          continue;
+        }
+
+        // Add day off to Google Sheets
+        existingDates.push(`${shiftDate} (выходной)`);
+        row[5] = existingDates.join(', ');
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${sheetName}!A${values.indexOf(row) + 1}:G${values.indexOf(row) + 1}`,
+          valueInputOption: 'RAW',
+          resource: { values: [row] },
+        });
+
+        // Send notification to employee
+        const user = await dbGet(
+          "SELECT DISTINCT username FROM shifts WHERE username = ? AND group_id = ?",
+          [username, config.groupId]
+        );
+        if (user) {
+          try {
+            await bot.telegram.sendMessage(
+              `@${username}`,
+              `📌 Сегодня, ${shiftDate}, у вас был выходной.`
+            );
+          } catch (err) {
+            logger.error(`Failed to notify ${username} about day off:`, err);
+          }
+        }
+      }
+    } catch (err) {
+      logger.error('Day off cron error:', err);
+    }
+  }, {
+    timezone: config.timezone
+  });
 });
 
 // Command handlers
@@ -315,16 +385,16 @@ W witag 1
 
   const fullName = match[1].trim();
   const startTime = match[2];
-  const endTime = [3];
+  const endTime = match[3];
   const zone = match[4].trim();
   const witag = match[5] ? match[5].trim() : 'Нет';
+  const shiftDate = getCurrentDate(timezone);
 
   if (!isValidTime(startTime) || !isValidTime(endTime)) {
     return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
   }
 
   try {
-    const shiftDate = getCurrentDate(timezone);
     const existingShifts = await dbAll(
       "SELECT start_time, end_time FROM shifts WHERE username = ? AND shift_date = ? AND group_id = ?",
       [username, shiftDate, groupId]
@@ -346,25 +416,47 @@ W witag 1
       [groupId, username, fullName, photoId, shiftDate, startTime, endTime, zone, witag]
     );
 
-    // Append to Google Sheets (Timesheet)
-    await sheets.spreadsheets.values.append({
+    const sheetName = 'Sheet1';
+    const sheetRange = `${sheetName}!A:G`;
+
+    const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: 'Timesheet!A:I',
-      valueInputOption: 'RAW',
-      resource: {
-        values: [[
-          groupId,
-          username,
-          fullName,
-          photoId,
-          shiftDate,
-          startTime,
-          endTime,
-          zone,
-          witag
-        ]]
-      }
+      range: sheetRange,
     });
+
+    const values = response.data.values || [];
+    const existingRowIndex = values.findIndex(row => row[2] === `@${username}`);
+
+    if (existingRowIndex >= 0) {
+      const existingDates = (values[existingRowIndex][5] || '').split(',').map(s => s.trim());
+      if (!existingDates.includes(shiftDate)) {
+        existingDates.push(shiftDate);
+        values[existingRowIndex][5] = existingDates.join(', ');
+        values[existingRowIndex][6] = 'Работал';
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${sheetName}!A${existingRowIndex + 1}:G${existingRowIndex + 1}`,
+          valueInputOption: 'RAW',
+          resource: { values: [values[existingRowIndex]] },
+        });
+      }
+    } else {
+      const newRow = [
+        values.length + 1,
+        fullName,
+        `@${username}`,
+        zone,
+        witag,
+        shiftDate,
+        'Работал'
+      ];
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: sheetRange,
+        valueInputOption: 'RAW',
+        resource: { values: [newRow] },
+      });
+    }
 
     await ctx.replyWithMarkdownV2(`
 ✅ *${escapeMarkdownV2(fullName)}* записан на смену
@@ -466,7 +558,6 @@ bot.action('timesheet', async (ctx) => {
 
     if (!shifts.length) return ctx.reply('📄 Смены не найдены');
 
-    // Group shifts by user
     const userShifts = {};
     for (const shift of shifts) {
       if (!userShifts[shift.full_name]) {
@@ -475,7 +566,6 @@ bot.action('timesheet', async (ctx) => {
       userShifts[shift.full_name].push(shift);
     }
 
-    // Generate timesheet data
     const timesheetData = [];
     const dates = [...new Set(shifts.map(s => s.shift_date))].sort();
     for (const [fullName, userShiftList] of Object.entries(userShifts)) {
@@ -495,7 +585,6 @@ bot.action('timesheet', async (ctx) => {
       timesheetData.push(row);
     }
 
-    // Update Google Sheets (Report)
     await sheets.spreadsheets.values.update({
       spreadsheetId,
       range: 'Report!A1',
@@ -522,7 +611,7 @@ bot.action('timesheet', async (ctx) => {
   }
 });
 
-bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
+bot.action(['end_shift_menu', 'cancel_shift_menu', 'manual_end_shift_menu'], async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
@@ -530,7 +619,8 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
-  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'cancel';
+  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' :
+                ctx.callbackQuery.data === 'manual_end_shift_menu' ? 'manual_end' : 'cancel';
 
   try {
     const shifts = await dbAll(
@@ -548,7 +638,7 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
     ]);
 
     await ctx.reply(
-      `Выберите смену для ${action === 'end' ? 'завершения' : 'отмены'}:`,
+      `Выберите смену для ${action === 'end' ? 'завершения' : action === 'manual_end' ? 'ручного завершения' : 'отмены'}:`,
       Markup.inlineKeyboard(buttons)
     );
   } catch (err) {
@@ -557,7 +647,7 @@ bot.action(['end_shift_menu', 'cancel_shift_menu'], async (ctx) => {
   }
 });
 
-bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
+bot.action(/^(end_shift_|cancel_shift_|manual_end_shift_)(\d+)$/, async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
@@ -566,7 +656,8 @@ bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
   }
 
   const shiftId = parseInt(ctx.match[2]);
-  const action = ctx.match[1].startsWith('end') ? 'end' : 'cancel';
+  const action = ctx.match[1].startsWith('end') ? 'end' :
+                ctx.match[1].startsWith('manual_end') ? 'manual_end' : 'cancel';
 
   try {
     const shift = await dbGet(
@@ -576,15 +667,93 @@ bot.action(/^(end_shift_|cancel_shift_)(\d+)$/, async (ctx) => {
 
     if (!shift) return ctx.reply('❌ Смена не найдена');
 
-    await ctx.replyWithMarkdownV2(
-      `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\\n` +
-      `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n` +
-      `⏰ ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}`,
-      shiftActionsKeyboard(shiftId)
-    );
+    if (action === 'manual_end') {
+      await ctx.replyWithMarkdownV2(
+        `Введите время фактического завершения для смены \\(ID: ${shiftId}\\):\\n` +
+        `@${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\) ` +
+        `${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}\\n` +
+        `Формат: ЧЧ:ММ \\(например, 18:59\\)`,
+        Markup.forceReply()
+      );
+      ctx.session = { awaitingManualEnd: true, shiftId };
+    } else {
+      await ctx.replyWithMarkdownV2(
+        `Подтвердите ${action === 'end' ? 'завершение' : 'отмену'} смены:\\n` +
+        `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n` +
+        `⏰ ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}`,
+        shiftActionsKeyboard(shiftId)
+      );
+    }
   } catch (err) {
     logger.error('shift action error:', err);
     await ctx.reply('❌ Ошибка подтверждения');
+  }
+});
+
+bot.on('text', async (ctx) => {
+  if (ctx.session?.awaitingManualEnd && ctx.message.reply_to_message) {
+    const username = ctx.from.username;
+    const groupId = ctx.groupConfig.groupId;
+    const shiftId = ctx.session.shiftId;
+
+    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+      return ctx.reply('🚫 Доступ запрещен');
+    }
+
+    const actualEndTime = ctx.message.text.trim();
+    if (!isValidTime(actualEndTime)) {
+      return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
+    }
+
+    try {
+      const shift = await dbGet(
+        "SELECT start_time, full_name, username FROM shifts WHERE id = ? AND group_id = ?",
+        [shiftId, groupId]
+      );
+
+      if (!shift) {
+        return ctx.reply('❌ Смена не найдена');
+      }
+
+      const workedHours = calculateWorkedHours(shift.start_time, actualEndTime);
+      await dbRun(
+        "UPDATE shifts SET status = ?, actual_end_time = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
+        ['completed', actualEndTime, workedHours, shiftId, groupId]
+      );
+
+      // Update Google Sheets status
+      const sheetName = 'Sheet1';
+      const sheetRange = `${sheetName}!A:G`;
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: sheetRange,
+      });
+
+      const values = response.data.values || [];
+      const existingRowIndex = values.findIndex(row => row[2] === `@${shift.username}`);
+
+      if (existingRowIndex >= 0) {
+        values[existingRowIndex][6] = 'Прерван';
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${sheetName}!A${existingRowIndex + 1}:G${existingRowIndex + 1}`,
+          valueInputOption: 'RAW',
+          resource: { values: [values[existingRowIndex]] },
+        });
+      }
+
+      await ctx.replyWithMarkdownV2(
+        `✅ Смена завершена вручную\\.\n` +
+        `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n` +
+        `Отработано: ${escapeMarkdownV2(workedHours)}`
+      );
+
+      delete ctx.session.awaitingManualEnd;
+      delete ctx.session.shiftId;
+    } catch (err) {
+      logger.error('Manual end shift error:', err);
+      await ctx.reply('❌ Ошибка завершения смены');
+    }
   }
 });
 
@@ -607,20 +776,84 @@ bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
 
     const workedHours = action === 'completed' ? calculateWorkedHours(shift.start_time, shift.end_time) : null;
 
-    const result = await dbRun(
+    await dbRun(
       "UPDATE shifts SET status = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
       [action, workedHours, shiftId, groupId]
     );
 
-    if (result.changes > 0) {
-      await ctx.reply(`✅ Смена ${shiftId} ${action === 'completed' ? 'завершена' : 'отменена'}`);
-    } else {
-      await ctx.reply('❌ Смена не найдена');
+    // Update Google Sheets status for completed shifts
+    if (action === 'completed') {
+      const sheetName = 'Sheet1';
+      const sheetRange = `${sheetName}!A:G`;
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: sheetRange,
+      });
+
+      const values = response.data.values || [];
+      const existingRowIndex = values.findIndex(row => row[2] === `@${username}`);
+
+      if (existingRowIndex >= 0) {
+        values[existingRowIndex][6] = 'Работал';
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${sheetName}!A${existingRowIndex + 1}:G${existingRowIndex + 1}`,
+          valueInputOption: 'RAW',
+          resource: { values: [values[existingRowIndex]] },
+        });
+      }
     }
+
+    await ctx.reply(`✅ Смена ${shiftId} ${action === 'completed' ? 'завершена' : 'отменена'}`);
   } catch (err) {
     logger.error('confirm action error:', err);
     await ctx.reply('❌ Ошибка обновления');
   }
+});
+
+// Auto-complete shifts at 23:05
+groupConfigs.forEach(config => {
+  cron.schedule('5 23 * * *', async () => {
+    try {
+      const shiftDate = getCurrentDate(config.timezone);
+      const shifts = await dbAll(
+        "SELECT id, start_time, end_time, username FROM shifts WHERE status = 'active' AND shift_date = ? AND group_id = ?",
+        [shiftDate, config.groupId]
+      );
+
+      for (const shift of shifts) {
+        const workedHours = calculateWorkedHours(shift.start_time, shift.end_time);
+        await dbRun(
+          "UPDATE shifts SET status = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
+          ['completed', workedHours, shift.id, config.groupId]
+        );
+
+        const sheetName = 'Sheet1';
+        const sheetRange = `${sheetName}!A:G`;
+        const response = await sheets.spreadsheets.values.get({
+          spreadsheetId,
+          range: sheetRange,
+        });
+
+        const values = response.data.values || [];
+        const existingRowIndex = values.findIndex(row => row[2] === `@${shift.username}`);
+
+        if (existingRowIndex >= 0) {
+          values[existingRowIndex][6] = 'Работал';
+          await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `${sheetName}!A${existingRowIndex + 1}:G${existingRowIndex + 1}`,
+            valueInputOption: 'RAW',
+            resource: { values: [values[existingRowIndex]] },
+          });
+        }
+      }
+    } catch (err) {
+      logger.error('Auto-complete shifts error:', err);
+    }
+  }, {
+    timezone: config.timezone
+  });
 });
 
 bot.catch((err, ctx) => {
