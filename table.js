@@ -90,8 +90,7 @@ const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📋 Активные', 'active_shifts')],
   [Markup.button.callback('📝 Табель', 'timesheet')],
   [
-    Markup.button.callback('🛑 Завершить', 'end_shift_menu'),
-    Markup.button.callback('🔚 Завершить вручную', 'manual_end_shift_menu'),
+    Markup.button.callback('🛑 Завершить смену', 'end_shift_menu'),
     Markup.button.callback('📋 /shifts', 'show_shifts_report')
   ]
 ]);
@@ -286,7 +285,7 @@ async function updateReportSheet(groupId, weekFilter = null) {
   const dayHeaders = [];
   for (let day = 1; day <= daysInMonth; day++) {
     const date = new Date(currentYear, currentMonth - 1, day);
-    headers.push(`${day}\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
+    headers.push(`${day}\\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
     dayHeaders.push(day);
   }
   headers.push('Всего смен', 'Всего часов');
@@ -602,15 +601,13 @@ bot.action('timesheet', async (ctx) => {
   }
 });
 
-bot.action(['end_shift_menu', 'manual_end_shift_menu'], async (ctx) => {
+bot.action('end_shift_menu', async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
   if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
-
-  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'manual_end';
 
   try {
     const shifts = await dbAll(
@@ -623,12 +620,12 @@ bot.action(['end_shift_menu', 'manual_end_shift_menu'], async (ctx) => {
     const buttons = shifts.map(shift => [
       Markup.button.callback(
         `${shift.id} @${escapeMarkdownV2(shift.username)} ${shift.start_time}-${shift.end_time}`,
-        `${action}_shift_${shift.id}`
+        `end_shift_${shift.id}`
       )
     ]);
 
     await ctx.reply(
-      `Выберите смену для ${action === 'end' ? 'завершения' : 'ручного завершения'}:`,
+      'Выберите смену для завершения:',
       Markup.inlineKeyboard(buttons)
     );
   } catch (err) {
@@ -637,7 +634,7 @@ bot.action(['end_shift_menu', 'manual_end_shift_menu'], async (ctx) => {
   }
 });
 
-bot.action(/^(end_shift_|manual_end_shift_)(\d+)$/, async (ctx) => {
+bot.action(/^end_shift_(\d+)$/, async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
@@ -645,8 +642,7 @@ bot.action(/^(end_shift_|manual_end_shift_)(\d+)$/, async (ctx) => {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
 
-  const shiftId = parseInt(ctx.match[2]);
-  const action = ctx.match[1].startsWith('end') ? 'end' : 'manual_end';
+  const shiftId = parseInt(ctx.match[1]);
 
   try {
     const shift = await dbGet(
@@ -656,111 +652,15 @@ bot.action(/^(end_shift_|manual_end_shift_)(\d+)$/, async (ctx) => {
 
     if (!shift) return ctx.reply('❌ Смена не найдена');
 
-    if (action === 'manual_end') {
-      await ctx.replyWithMarkdownV2(
-        `Введите время фактического завершения для смены (ID: ${shiftId}):\\n` +
-        `@${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)}) ` +
-        `${escapeMarkdownV2(shift.start_time)}-${escapeMarkdownV2(shift.end_time)}\\n` +
-        `Формат: ЧЧ:ММ (например, 18:59)`,
-        Markup.forceReply()
-      );
-      ctx.session = { awaitingManualEnd: true, shiftId };
-    } else {
-      await ctx.replyWithMarkdownV2(
-        `Подтвердите завершение смены:\\n` +
-        `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)})\\n` +
-        `⏰ ${escapeMarkdownV2(shift.start_time)}-${escapeMarkdownV2(shift.end_time)}`,
-        shiftActionsKeyboard(shiftId)
-      );
-    }
+    await ctx.replyWithMarkdownV2(
+      `Подтвердите завершение смены\\:\\n` +
+      `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} \\(${escapeMarkdownV2(shift.full_name)}\\)\\n` +
+      `⏰ ${escapeMarkdownV2(shift.start_time)}\\-${escapeMarkdownV2(shift.end_time)}`,
+      shiftActionsKeyboard(shiftId)
+    );
   } catch (err) {
     logger.error('shift action error:', err);
     await ctx.reply('❌ Ошибка подтверждения');
-  }
-});
-
-bot.on('text', async (ctx) => {
-  if (ctx.session?.awaitingManualEnd && ctx.message.reply_to_message) {
-    const username = ctx.from.username;
-    const groupId = ctx.groupConfig.groupId;
-    const shiftId = ctx.session.shiftId;
-
-    if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
-      return ctx.reply('🚫 Доступ запрещен');
-    }
-
-    const actualEndTime = ctx.message.text.trim();
-    if (!isValidTime(actualEndTime)) return ctx.reply('❌ Неверный формат времени (ЧЧ:ММ)');
-
-    try {
-      const shift = await dbGet(
-        "SELECT start_time, full_name, username FROM shifts WHERE id = ? AND group_id = ?",
-        [shiftId, groupId]
-      );
-
-      if (!shift) return ctx.reply('❌ Смена не найдена');
-
-      const workedHours = calculateWorkedHours(shift.start_time, actualEndTime);
-      await dbRun(
-        "UPDATE shifts SET status = ?, actual_end_time = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
-        ['completed', actualEndTime, workedHours, shiftId, groupId]
-      );
-
-      const timesheetRange = 'Timesheet!A:K';
-      const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
-      const timesheetValues = timesheetResponse.data.values || [];
-      const existingRowIndex = timesheetValues.findIndex(row => row[2] === `@${shift.username}`);
-      if (existingRowIndex >= 0) {
-        timesheetValues[existingRowIndex][6] = 'Прерван';
-        timesheetValues[existingRowIndex][9] = actualEndTime;
-        timesheetValues[existingRowIndex][10] = workedHours;
-        await sheets.spreadsheets.values.update({
-          spreadsheetId,
-          range: `Timesheet!A${existingRowIndex + 2}:K${existingRowIndex + 2}`,
-          valueInputOption: 'RAW',
-          resource: { values: [timesheetValues[existingRowIndex]] },
-        });
-      }
-
-      const actionDate = format(new Date(), 'dd.MM.yyyy HH:mm');
-      const newFailRow = [
-        shiftId,
-        shift.full_name,
-        shift.username,
-        timesheetValues[existingRowIndex][5].split('\n').pop(),
-        shift.start_time,
-        actualEndTime,
-        workedHours,
-        actionDate,
-        username
-      ];
-      await sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range: 'shift_fail!A:I',
-        valueInputOption: 'RAW',
-        resource: { values: [newFailRow] },
-      });
-
-      await updateReportSheet(groupId);
-
-      await ctx.replyWithMarkdownV2(
-        `✅ Смена завершена вручную.\n` +
-        `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)})\n` +
-        `Отработано: ${escapeMarkdownV2(workedHours)}`
-      );
-
-      try {
-        await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена (ID: ${shiftId}) завершена вручную. Отработано: ${workedHours}`);
-      } catch (err) {
-        logger.error(`Failed to notify ${shift.username} about manual end:`, err);
-      }
-
-      delete ctx.session.awaitingManualEnd;
-      delete ctx.session.shiftId;
-    } catch (err) {
-      logger.error('Manual end shift error:', err);
-      await ctx.reply('❌ Ошибка завершения смены');
-    }
   }
 });
 
@@ -804,7 +704,7 @@ bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
     await updateReportSheet(groupId);
 
     try {
-      await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена (ID: ${shiftId}) завершена. Отработано: ${workedHours}`);
+      await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена \\(ID: ${shiftId}\\) завершена\\. Отработано: ${workedHours}`);
     } catch (err) {
       logger.error(`Failed to notify ${shift.username} about end:`, err);
     }
