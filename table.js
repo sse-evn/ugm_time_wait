@@ -1,12 +1,11 @@
 require('dotenv').config();
 const sqlite3 = require('sqlite3').verbose();
 const { Telegraf, Markup } = require('telegraf');
-const { format } = require('date-fns');
+const { format, getWeek, addDays } = require('date-fns');
 const winston = require('winston');
 const { google } = require('googleapis');
 const cron = require('node-cron');
 
-// Configure logging
 const logger = winston.createLogger({
   level: 'debug',
   format: winston.format.combine(
@@ -21,7 +20,6 @@ const logger = winston.createLogger({
   ]
 });
 
-// Initialize Google Sheets API
 const auth = new google.auth.GoogleAuth({
   keyFile: process.env.GOOGLE_SHEETS_CREDENTIALS_PATH,
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
@@ -29,7 +27,6 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: 'v4', auth });
 const spreadsheetId = '1QWCYpeBQGofESEkD4WWYAIl0fvVDt7VZvWOE-qKe_RE';
 
-// Load group configurations from .env
 const groupConfigs = [];
 let groupIndex = 1;
 while (process.env[`GROUP${groupIndex}_ID`]) {
@@ -47,7 +44,6 @@ while (process.env[`GROUP${groupIndex}_ID`]) {
     adminUsernames: adminUsernames.split(',').map(u => u.trim().replace('@', '')),
     timezone: groupTimezone
   });
-  logger.info('Loaded group config:', { groupId, adminUsernames, timezone: groupTimezone });
 
   groupIndex++;
 }
@@ -57,10 +53,8 @@ if (groupConfigs.length === 0) {
   process.exit(1);
 }
 
-// Database setup
 const db = new sqlite3.Database('shifts.db');
 
-// Initialize database
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS shifts (
@@ -82,12 +76,10 @@ db.serialize(() => {
   `);
 });
 
-// Database functions
 const dbGet = (query, params = []) => new Promise((resolve, reject) => db.get(query, params, (err, row) => err ? reject(err) : resolve(row)));
 const dbAll = (query, params = []) => new Promise((resolve, reject) => db.all(query, params, (err, rows) => err ? reject(err) : resolve(rows)));
 const dbRun = (query, params = []) => new Promise((resolve, reject) => db.run(query, params, function(err) { err ? reject(err) : resolve(this); }));
 
-// Helper functions
 const escapeMarkdownV2 = (text) => (text || '').replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
 const getGroupConfig = (groupId) => groupConfigs.find(config => config.groupId === groupId) || { botToken: process.env.BOT_TOKEN };
 const isAdmin = (username, adminUsernames) => adminUsernames.includes(username.replace('@', ''));
@@ -104,25 +96,30 @@ const calculateWorkedHours = (start, end) => {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 };
 
-// Keyboards
 const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('📊 Отчет', 'admin_report')],
   [Markup.button.callback('📋 Активные', 'active_shifts')],
   [Markup.button.callback('📝 Табель', 'timesheet')],
   [
+    Markup.button.callback('🛑 Завершить', 'end_shift_menu'),
     Markup.button.callback('🔚 Завершить вручную', 'manual_end_shift_menu'),
     Markup.button.callback('📋 /shifts', 'show_shifts_report')
   ]
+]);
+
+const weekFilterKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('Текущая неделя', 'report_week_current')],
+  [Markup.button.callback('Прошлая неделя', 'report_week_previous')],
+  [Markup.button.callback('Следующая неделя', 'report_week_next')],
+  [Markup.button.callback('Весь месяц', 'report_month')]
 ]);
 
 const shiftActionsKeyboard = (shiftId) => Markup.inlineKeyboard([
   [Markup.button.callback('✅ Подтвердить', `confirm_action_${shiftId}`), Markup.button.callback('❌ Отменить', 'cancel_action')]
 ]);
 
-// Initialize bot
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Middleware to load group config
 bot.use(async (ctx, next) => {
   const groupId = ctx.chat?.id?.toString();
   if (!groupId || ctx.chat.type === 'private') return ctx.reply('❌ Этот бот работает только в группах');
@@ -132,30 +129,30 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// Ensure sheet exists
 async function ensureSheetExists(spreadsheetId, sheetName) {
   try {
     const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
     const sheetExists = spreadsheet.data.sheets.some(sheet => sheet.properties.title === sheetName);
+    
     if (!sheetExists) {
       await sheets.spreadsheets.batchUpdate({
         spreadsheetId,
-        resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] }
+        resource: {
+          requests: [{
+            addSheet: {
+              properties: {
+                title: sheetName,
+                gridProperties: {
+                  rowCount: 100,
+                  columnCount: 37
+                }
+              }
+            }
+          }]
+        }
       });
-      logger.info(`Created sheet: ${sheetName}`);
-      let headers;
-      if (sheetName === 'Timesheet') headers = ['№', 'Full Name', 'Username', 'Зона', 'Wiatag', 'Дни выхода', 'Статус дня', 'Start Time', 'End Time', 'Actual End Time', 'Worked Hours'];
-      else if (sheetName === 'Report') headers = ['Full Name', ...Array(31).fill().map((_, i) => i + 1), 'Summary'];
-      else if (sheetName === 'shift_fail') headers = ['Shift ID', 'Full Name', 'Username', 'Shift Date', 'Start Time', 'Actual End Time', 'Worked Hours', 'Action Date', 'Admin Username'];
-      if (headers) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId,
-          range: `${sheetName}!A1:${String.fromCharCode(64 + headers.length)}1`,
-          valueInputOption: 'RAW',
-          resource: { values: [headers] }
-        });
-        logger.info(`Initialized headers for ${sheetName}`);
-      }
+
+      await applySheetFormatting(spreadsheetId, sheetName);
     }
   } catch (err) {
     logger.error(`Error ensuring sheet exists (${sheetName}):`, err);
@@ -163,7 +160,204 @@ async function ensureSheetExists(spreadsheetId, sheetName) {
   }
 }
 
-// Admin command
+async function applySheetFormatting(spreadsheetId, sheetName) {
+  try {
+    const requests = [
+      {
+        repeatCell: {
+          range: {
+            sheetId: await getSheetId(spreadsheetId, sheetName),
+            startRowIndex: 0,
+            endRowIndex: 1
+          },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: { red: 0.2, green: 0.6, blue: 0.8 },
+              textFormat: { bold: true, fontSize: 12 }
+            }
+          },
+          fields: "userEnteredFormat(backgroundColor,textFormat)"
+        }
+      },
+      {
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [{
+              sheetId: await getSheetId(spreadsheetId, sheetName),
+              startRowIndex: 1
+            }],
+            booleanRule: {
+              condition: {
+                type: 'CUSTOM_FORMULA',
+                values: [{ userEnteredValue: '=MOD(ROW(),2)=0' }]
+              },
+              format: {
+                backgroundColor: { red: 0.95, green: 0.95, blue: 0.95 }
+              }
+            }
+          },
+          index: 0
+        }
+      },
+      {
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [{
+              sheetId: await getSheetId(spreadsheetId, sheetName),
+              startRowIndex: 1,
+              startColumnIndex: 1,
+              endColumnIndex: 32
+            }],
+            booleanRule: {
+              condition: {
+                type: 'CUSTOM_FORMULA',
+                values: [{ userEnteredValue: '=OR(WEEKDAY(DATE($B$1,$A$1,COLUMN()-1),2)>5)' }]
+              },
+              format: {
+                backgroundColor: { red: 1, green: 0.8, blue: 0.8 }
+              }
+            }
+          },
+          index: 1
+        }
+      }
+    ];
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: { requests }
+    });
+  } catch (err) {
+    logger.error('Error applying sheet formatting:', err);
+  }
+}
+
+async function getSheetId(spreadsheetId, sheetName) {
+  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = spreadsheet.data.sheets.find(s => s.properties.title === sheetName);
+  return sheet.properties.sheetId;
+}
+
+async function updateReportSheet(groupId, weekFilter = null) {
+  try {
+    const currentDate = new Date();
+    const currentMonth = currentDate.getMonth() + 1;
+    const currentYear = currentDate.getFullYear();
+    const daysInMonth = new Date(currentYear, currentMonth, 0).getDate();
+
+    let startDate, endDate;
+    if (weekFilter === 'current') {
+      const currentWeek = getWeek(currentDate);
+      startDate = addDays(currentDate, -currentDate.getDay() + 1);
+      endDate = addDays(startDate, 6);
+    } else if (weekFilter === 'previous') {
+      const prevWeekDate = addDays(currentDate, -7);
+      const prevWeek = getWeek(prevWeekDate);
+      startDate = addDays(prevWeekDate, -prevWeekDate.getDay() + 1);
+      endDate = addDays(startDate, 6);
+    } else if (weekFilter === 'next') {
+      const nextWeekDate = addDays(currentDate, 7);
+      const nextWeek = getWeek(nextWeekDate);
+      startDate = addDays(nextWeekDate, -nextWeekDate.getDay() + 1);
+      endDate = addDays(startDate, 6);
+    } else {
+      startDate = new Date(currentYear, currentMonth - 1, 1);
+      endDate = new Date(currentYear, currentMonth, 0);
+    }
+
+    const users = await dbAll(
+      "SELECT DISTINCT username, full_name FROM shifts WHERE group_id = ?",
+      [groupId]
+    );
+
+    const shifts = await dbAll(
+      `SELECT username, full_name, shift_date, start_time, end_time 
+       FROM shifts 
+       WHERE group_id = ? 
+         AND date(shift_date, 'unixepoch') BETWEEN date(?, 'unixepoch') AND date(?, 'unixepoch')`,
+      [groupId, Math.floor(startDate.getTime()/1000), Math.floor(endDate.getTime()/1000)]
+    );
+
+    const reportData = {};
+    users.forEach(user => {
+      reportData[user.username] = {
+        fullName: user.full_name,
+        days: {},
+        totalShifts: 0,
+        totalHours: 0
+      };
+    });
+
+    shifts.forEach(shift => {
+      const day = parseInt(shift.shift_date.split('.')[0]);
+      if (reportData[shift.username]) {
+        reportData[shift.username].days[day] = 
+          `${shift.start_time}-${shift.end_time}`;
+        reportData[shift.username].totalShifts++;
+        
+        const [startH, startM] = shift.start_time.split(':').map(Number);
+        const [endH, endM] = shift.end_time.split(':').map(Number);
+        let hours = endH - startH;
+        let minutes = endM - startM;
+        if (minutes < 0) {
+          hours--;
+          minutes += 60;
+        }
+        reportData[shift.username].totalHours += hours + (minutes / 60);
+      }
+    });
+
+    const headers = ['ФИО'];
+    const dayHeaders = [];
+    for (let day = 1; day <= daysInMonth; day++) {
+      const date = new Date(currentYear, currentMonth - 1, day);
+      headers.push(`${day}\n${['Вс','Пн','Вт','Ср','Чт','Пт','Сб'][date.getDay()]}`);
+      dayHeaders.push(day);
+    }
+    headers.push('Всего смен', 'Всего часов');
+
+    const values = [headers];
+    Object.values(reportData).forEach(userData => {
+      const row = [userData.fullName];
+      dayHeaders.forEach(day => {
+        row.push(userData.days[day] || '');
+      });
+      row.push(userData.totalShifts);
+      row.push(userData.totalHours.toFixed(1));
+      values.push(row);
+    });
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `Report!A1:AG`,
+      valueInputOption: 'RAW',
+      resource: { values }
+    });
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: {
+        requests: [{
+          autoResizeDimensions: {
+            dimensions: {
+              sheetId: await getSheetId(spreadsheetId, 'Report'),
+              dimension: 'COLUMNS',
+              startIndex: 0,
+              endIndex: headers.length
+            }
+          }
+        }]
+      }
+    });
+
+    logger.info('Report sheet updated successfully');
+    return { startDate, endDate };
+  } catch (err) {
+    logger.error('Error updating report sheet:', err);
+    throw err;
+  }
+}
+
 bot.command('admin', async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
@@ -175,7 +369,6 @@ bot.command('admin', async (ctx) => {
   await ctx.reply('📋 Админ-панель:', adminKeyboard);
 });
 
-// Cron job for marking day off at 18:16
 groupConfigs.forEach(config => {
   cron.schedule('16 18 * * *', async () => {
     try {
@@ -185,7 +378,7 @@ groupConfigs.forEach(config => {
       const values = response.data.values || [];
       if (values.length === 0) return;
 
-      const employees = values.slice(1); // Skip headers
+      const employees = values.slice(1);
       for (const row of employees) {
         const username = row[2]?.replace('@', '');
         const fullName = row[1];
@@ -226,7 +419,6 @@ groupConfigs.forEach(config => {
   }, { timezone: config.timezone });
 });
 
-// Photo handler
 bot.on('photo', async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
@@ -324,36 +516,7 @@ W witag 1
       });
     }
 
-    // Update Report sheet
-    const reportRange = 'Report!A1:AF1'; // A to AF for 31 days + Full Name + Summary
-    await ensureSheetExists(spreadsheetId, 'Report');
-    const reportResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: reportRange });
-    const reportValues = reportResponse.data.values || [];
-    const month = new Date().getMonth() + 1;
-    const reportRowIndex = reportValues.findIndex(row => row[0] === fullName);
-
-    if (reportRowIndex >= 0) {
-      const dayIndex = new Date(shiftDate.split('.').reverse().join('-')).getDate();
-      reportValues[reportRowIndex][dayIndex] = 'вышел';
-      reportValues[reportRowIndex][32] = reportValues[reportRowIndex].slice(1, 32).filter(d => d === 'вышел').length;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `Report!A${reportRowIndex + 2}:AF${reportRowIndex + 2}`,
-        valueInputOption: 'RAW',
-        resource: { values: [reportValues[reportRowIndex]] },
-      });
-    } else {
-      const newReportRow = [fullName, ...Array(31).fill(''), ''];
-      const dayIndex = new Date(shiftDate.split('.').reverse().join('-')).getDate();
-      newReportRow[dayIndex] = 'вышел';
-      newReportRow[32] = 1;
-      await sheets.spreadsheets.values.append({
-        spreadsheetId,
-        range: reportRange,
-        valueInputOption: 'RAW',
-        resource: { values: [newReportRow] },
-      });
-    }
+    await updateReportSheet(groupId);
 
     await ctx.replyWithMarkdownV2(`
 ✅ *${escapeMarkdownV2(fullName)}* записан на смену
@@ -368,7 +531,6 @@ W witag 1
   }
 });
 
-// Admin handlers
 bot.action('admin_report', async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
@@ -378,20 +540,40 @@ bot.action('admin_report', async (ctx) => {
   }
 
   try {
-    const reportRange = 'Report!A2:AF';
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: reportRange });
-    const values = response.data.values || [];
-    if (!values.length) return ctx.reply('📄 Отчет пуст');
-
-    let message = '📊 *Отчет по сменам*\n';
-    values.forEach(row => {
-      message += `\n📅 *${row[0]}*: ${row.slice(1, 32).map((d, i) => d ? `${i + 1} ${d}` : '').filter(Boolean).join(', ')} (Всего: ${row[32] || 0})\n`;
-    });
-
-    await ctx.replyWithMarkdownV2(message);
+    await updateReportSheet(groupId);
+    await ctx.reply('Выберите период для отчета:', weekFilterKeyboard);
   } catch (err) {
     logger.error('admin_report error:', err);
     await ctx.reply('❌ Ошибка отчета');
+  }
+});
+
+bot.action(/^report_(week|month)_(\w+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  try {
+    const filterType = ctx.match[1];
+    const filterValue = ctx.match[2];
+    let weekFilter = null;
+    
+    if (filterType === 'week') {
+      weekFilter = filterValue;
+    }
+
+    const { startDate, endDate } = await updateReportSheet(groupId, weekFilter);
+    
+    await ctx.replyWithMarkdownV2(
+      `📊 *Отчет обновлен*\\n` +
+      `📅 Период: *${format(startDate, 'dd.MM.yyyy')} - ${format(endDate, 'dd.MM.yyyy')}*`
+    );
+  } catch (err) {
+    logger.error('Week filter error:', err);
+    await ctx.reply('❌ Ошибка фильтрации отчета');
   }
 });
 
@@ -450,13 +632,15 @@ bot.action('timesheet', async (ctx) => {
   }
 });
 
-bot.action(['manual_end_shift_menu'], async (ctx) => {
+bot.action(['end_shift_menu', 'manual_end_shift_menu'], async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
   if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
     return ctx.answerCbQuery('🚫 Доступ запрещен');
   }
+
+  const action = ctx.callbackQuery.data === 'end_shift_menu' ? 'end' : 'manual_end';
 
   try {
     const shifts = await dbAll(
@@ -469,12 +653,12 @@ bot.action(['manual_end_shift_menu'], async (ctx) => {
     const buttons = shifts.map(shift => [
       Markup.button.callback(
         `${shift.id} @${escapeMarkdownV2(shift.username)} ${shift.start_time}-${shift.end_time}`,
-        `manual_end_shift_${shift.id}`
+        `${action}_shift_${shift.id}`
       )
     ]);
 
     await ctx.reply(
-      'Выберите смену для ручного завершения:',
+      `Выберите смену для ${action === 'end' ? 'завершения' : 'ручного завершения'}:`,
       Markup.inlineKeyboard(buttons)
     );
   } catch (err) {
@@ -483,7 +667,7 @@ bot.action(['manual_end_shift_menu'], async (ctx) => {
   }
 });
 
-bot.action(/^(manual_end_shift_)(\d+)$/, async (ctx) => {
+bot.action(/^(end_shift_|manual_end_shift_)(\d+)$/, async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
 
@@ -492,6 +676,7 @@ bot.action(/^(manual_end_shift_)(\d+)$/, async (ctx) => {
   }
 
   const shiftId = parseInt(ctx.match[2]);
+  const action = ctx.match[1].startsWith('end') ? 'end' : 'manual_end';
 
   try {
     const shift = await dbGet(
@@ -501,14 +686,23 @@ bot.action(/^(manual_end_shift_)(\d+)$/, async (ctx) => {
 
     if (!shift) return ctx.reply('❌ Смена не найдена');
 
-    await ctx.replyWithMarkdownV2(
-      `Введите время фактического завершения для смены (ID: ${shiftId}):\\n` +
-      `@${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)}) ` +
-      `${escapeMarkdownV2(shift.start_time)}-${escapeMarkdownV2(shift.end_time)}\\n` +
-      `Формат: ЧЧ:ММ (например, 18:59)`,
-      Markup.forceReply()
-    );
-    ctx.session = { awaitingManualEnd: true, shiftId };
+    if (action === 'manual_end') {
+      await ctx.replyWithMarkdownV2(
+        `Введите время фактического завершения для смены (ID: ${shiftId}):\\n` +
+        `@${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)}) ` +
+        `${escapeMarkdownV2(shift.start_time)}-${escapeMarkdownV2(shift.end_time)}\\n` +
+        `Формат: ЧЧ:ММ (например, 18:59)`,
+        Markup.forceReply()
+      );
+      ctx.session = { awaitingManualEnd: true, shiftId };
+    } else {
+      await ctx.replyWithMarkdownV2(
+        `Подтвердите завершение смены:\\n` +
+        `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)})\\n` +
+        `⏰ ${escapeMarkdownV2(shift.start_time)}-${escapeMarkdownV2(shift.end_time)}`,
+        shiftActionsKeyboard(shiftId)
+      );
+    }
   } catch (err) {
     logger.error('shift action error:', err);
     await ctx.reply('❌ Ошибка подтверждения');
@@ -542,7 +736,6 @@ bot.on('text', async (ctx) => {
         ['completed', actualEndTime, workedHours, shiftId, groupId]
       );
 
-      // Update Timesheet
       const timesheetRange = 'Timesheet!A:K';
       const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
       const timesheetValues = timesheetResponse.data.values || [];
@@ -559,7 +752,6 @@ bot.on('text', async (ctx) => {
         });
       }
 
-      // Log to shift_fail
       const actionDate = format(new Date(), 'dd.MM.yyyy HH:mm');
       const newFailRow = [
         shiftId,
@@ -579,11 +771,19 @@ bot.on('text', async (ctx) => {
         resource: { values: [newFailRow] },
       });
 
+      await updateReportSheet(groupId);
+
       await ctx.replyWithMarkdownV2(
         `✅ Смена завершена вручную.\n` +
         `🆔 *${shiftId}* @${escapeMarkdownV2(shift.username)} (${escapeMarkdownV2(shift.full_name)})\n` +
         `Отработано: ${escapeMarkdownV2(workedHours)}`
       );
+
+      try {
+        await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена (ID: ${shiftId}) завершена вручную. Отработано: ${workedHours}`);
+      } catch (err) {
+        logger.error(`Failed to notify ${shift.username} about manual end:`, err);
+      }
 
       delete ctx.session.awaitingManualEnd;
       delete ctx.session.shiftId;
@@ -594,7 +794,58 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// New action for /shifts report
+bot.action(/^confirm_action_(\d+)$/, async (ctx) => {
+  const username = ctx.from.username;
+  const groupId = ctx.groupConfig.groupId;
+
+  if (!username || !isAdmin(username, ctx.groupConfig.adminUsernames)) {
+    return ctx.answerCbQuery('🚫 Доступ запрещен');
+  }
+
+  const shiftId = parseInt(ctx.match[1]);
+
+  try {
+    const shift = await dbGet(
+      "SELECT start_time, end_time, username, full_name FROM shifts WHERE id = ? AND group_id = ?",
+      [shiftId, groupId]
+    );
+
+    const workedHours = calculateWorkedHours(shift.start_time, shift.end_time);
+    await dbRun(
+      "UPDATE shifts SET status = ?, worked_hours = ? WHERE id = ? AND group_id = ?",
+      ['completed', workedHours, shiftId, groupId]
+    );
+
+    const timesheetRange = 'Timesheet!A:K';
+    const timesheetResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: timesheetRange });
+    const timesheetValues = timesheetResponse.data.values || [];
+    const existingRowIndex = timesheetValues.findIndex(row => row[2] === `@${shift.username}`);
+    if (existingRowIndex >= 0) {
+      timesheetValues[existingRowIndex][6] = 'Работал';
+      timesheetValues[existingRowIndex][10] = workedHours;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `Timesheet!A${existingRowIndex + 2}:K${existingRowIndex + 2}`,
+        valueInputOption: 'RAW',
+        resource: { values: [timesheetValues[existingRowIndex]] },
+      });
+    }
+
+    await updateReportSheet(groupId);
+
+    try {
+      await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена (ID: ${shiftId}) завершена. Отработано: ${workedHours}`);
+    } catch (err) {
+      logger.error(`Failed to notify ${shift.username} about end:`, err);
+    }
+
+    await ctx.reply(`✅ Смена ${shiftId} завершена`);
+  } catch (err) {
+    logger.error('confirm action error:', err);
+    await ctx.reply('❌ Ошибка обновления');
+  }
+});
+
 bot.action('show_shifts_report', async (ctx) => {
   const username = ctx.from.username;
   const groupId = ctx.groupConfig.groupId;
@@ -625,7 +876,6 @@ bot.action('show_shifts_report', async (ctx) => {
   }
 });
 
-// Auto-complete shifts at 23:05
 groupConfigs.forEach(config => {
   cron.schedule('5 23 * * *', async () => {
     try {
@@ -655,8 +905,16 @@ groupConfigs.forEach(config => {
             valueInputOption: 'RAW',
             resource: { values: [timesheetValues[existingRowIndex]] },
           });
+
+          try {
+            await bot.telegram.sendMessage(`@${shift.username}`, `ℹ️ Ваша смена (ID: ${shift.id}) завершена автоматически. Отработано: ${workedHours}`);
+          } catch (err) {
+            logger.error(`Failed to notify ${shift.username} about auto-complete:`, err);
+          }
         }
       }
+
+      await updateReportSheet(config.groupId);
     } catch (err) {
       logger.error('Auto-complete shifts error:', err);
     }
